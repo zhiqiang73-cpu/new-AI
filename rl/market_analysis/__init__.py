@@ -5,12 +5,15 @@
 from .indicators import TechnicalAnalyzer
 from .level_finder import BestLevelFinder
 from .levels import LevelDiscovery, LevelScoring
+from .regime import MarketRegimeDetector, BreakoutDetector
 
 __all__ = [
     'TechnicalAnalyzer',
     'BestLevelFinder',
     'LevelDiscovery',
     'LevelScoring',
+    'MarketRegimeDetector',
+    'BreakoutDetector',
 ]
 
 

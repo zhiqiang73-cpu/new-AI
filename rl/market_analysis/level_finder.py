@@ -187,7 +187,8 @@ class BestLevelFinder:
 
         before = self.stats.get("weights", DEFAULT_WEIGHTS).copy()
         weights = before.copy()
-        lr = self.stats.get("learning_rate", 0.05)
+        # Increased learning rate for faster adaptation
+        lr = self.stats.get("learning_rate", 0.12)
         for k in weights:
             delta = lr * reward * (features.get(k, 0) - 0.5)
             weights[k] = max(0.01, weights[k] + delta)

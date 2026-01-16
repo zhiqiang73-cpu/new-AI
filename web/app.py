@@ -369,6 +369,68 @@ def positions():
                     file_data = json.load(f)
                     agent_positions = file_data.get("positions", [])
 
+        def _sync_external_positions(active_positions, agent_positions_list, agent_obj):
+            if not active_positions:
+                return agent_positions_list
+            updated = False
+            for ex in active_positions:
+                amt = float(ex.get("positionAmt", 0))
+                if abs(amt) <= 0:
+                    continue
+                direction = "LONG" if amt > 0 else "SHORT"
+                exchange_qty = abs(amt)
+                exchange_entry = float(ex.get("entryPrice", 0))
+                exchange_leverage = int(ex.get("leverage", 10))
+                agent_qty = sum(
+                    float(p.get("quantity", 0))
+                    for p in agent_positions_list
+                    if p.get("direction") == direction
+                )
+                diff = exchange_qty - agent_qty
+                if diff <= 0.0005:
+                    continue
+                trade_id = f"EXTERNAL-{direction}-{exchange_entry:.2f}-{diff:.4f}"
+                if any(p.get("trade_id") == trade_id for p in agent_positions_list):
+                    continue
+                sl_pct = 0.003
+                tp_pct = 0.035
+                if direction == "LONG":
+                    stop_loss = exchange_entry * (1 - sl_pct)
+                    take_profit = exchange_entry * (1 + tp_pct)
+                else:
+                    stop_loss = exchange_entry * (1 + sl_pct)
+                    take_profit = exchange_entry * (1 - tp_pct)
+                external_pos = {
+                    "trade_id": trade_id,
+                    "direction": direction,
+                    "entry_price": exchange_entry,
+                    "quantity": diff,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "leverage": exchange_leverage,
+                    "timestamp_open": datetime.now().isoformat(),
+                    "entry_reason": "external_sync",
+                    "external": True,
+                }
+                agent_positions_list.append(external_pos)
+                if agent_obj and getattr(agent_obj, "positions", None) is not None:
+                    agent_obj.positions.append(external_pos)
+                    try:
+                        agent_obj._save_positions()
+                    except Exception:
+                        pass
+                updated = True
+            if updated and not agent_obj:
+                try:
+                    pos_file = os.path.join(RL_DATA_DIR, "active_positions.json")
+                    with open(pos_file, "w", encoding="utf-8") as f:
+                        json.dump({"positions": agent_positions_list}, f, indent=2)
+                except Exception:
+                    pass
+            return agent_positions_list
+
+        agent_positions = _sync_external_positions(active, agent_positions, agent)
+
         result = []
         for p in active:
             amt = float(p["positionAmt"])
@@ -465,6 +527,7 @@ def positions():
                     "takeProfit": ap.get("take_profit"),
                     "liquidationPrice": None,
                     "timestampOpen": ap.get("timestamp_open"),
+                    "source": "external" if ap.get("external") else "agent",
                 }
             )
         exchange_qty = sum(abs(float(p.get("positionAmt", 0))) for p in active)

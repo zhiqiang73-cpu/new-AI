@@ -11,10 +11,12 @@ from ..execution.sl_tp import PositionSizer, StopLossTakeProfit
 from ..learning.dynamic_threshold import DynamicThresholdOptimizer
 from ..learning.north_star import NorthStarOptimizer
 from ..learning.strategy_params import StrategyParamLearner
+from ..learning.exit_learner import ExitTimingLearner
 from ..market_analysis.indicators import TechnicalAnalyzer
 from ..market_analysis.level_finder import BestLevelFinder, FEATURE_NAMES_CN
 from ..market_analysis.levels import LevelDiscovery, LevelScoring
 from ..market_analysis.multi_timeframe_analyzer import MultiTimeframeAnalyzer
+from ..market_analysis.regime import MarketRegimeDetector, BreakoutDetector
 from ..position.batch_position_manager import BatchPositionManager
 from ..risk.risk_controller import RiskController
 from .knowledge import EvolutionManager, KnowledgeBase, TradeLogger
@@ -64,6 +66,13 @@ class TradingAgent:
         self.batch_manager = BatchPositionManager()
         self.risk = RiskController()
         self.thoughts = ThoughtChain()
+
+        # New modules: Market regime & Breakout detection
+        self.regime_detector = MarketRegimeDetector()
+        self.breakout_detector = BreakoutDetector()
+        self.exit_learner = ExitTimingLearner(data_dir)
+        self.current_regime = None
+        self.regime_adjustments = {}
 
         self.best_support = None
         self.best_resistance = None
@@ -413,6 +422,29 @@ class TradingAgent:
             level_scores, key=lambda x: x["score"], reverse=True
         )[:12]
 
+        # Detect market regime (TRENDING / RANGING / VOLATILE)
+        ema_short = analysis_15m.get("ema_short", current_price)
+        ema_long = analysis_15m.get("ema_long", current_price)
+        regime_info = self.regime_detector.detect(
+            kl_15m, atr_15m, ema_short, ema_long
+        )
+        self.current_regime = regime_info.get("regime", "NORMAL")
+        self.regime_adjustments = self.regime_detector.get_strategy_adjustments(
+            self.current_regime
+        )
+
+        # Check for breakouts of best S/R levels
+        breakout_support = None
+        breakout_resistance = None
+        if best_support:
+            breakout_support = self.breakout_detector.check_breakout(
+                best_support["price"], "support", kl_1m
+            )
+        if best_resistance:
+            breakout_resistance = self.breakout_detector.check_breakout(
+                best_resistance["price"], "resistance", kl_1m
+            )
+
         market = {
             "current_price": kl_1m[-1]["close"],
             "analysis_1m": analysis_1m,
@@ -427,6 +459,10 @@ class TradingAgent:
             "level_scores": self.last_level_scores,
             "tf_weights": tf_weights,
             "klines_1m": kl_1m[-240:] if kl_1m else [],
+            # New: regime and breakout info
+            "regime": regime_info,
+            "breakout_support": breakout_support,
+            "breakout_resistance": breakout_resistance,
         }
         self.last_market = market
         return market
@@ -436,45 +472,89 @@ class TradingAgent:
         price = market["current_price"]
         long_score = 0
         short_score = 0
+        breakout_signal = None
 
-        # 趋势贡献（降低到20分）
+        # Check for breakout signals (highest priority)
+        br_support = market.get("breakout_support", {})
+        br_resistance = market.get("breakout_resistance", {})
+
+        if br_support and br_support.get("is_confirmed"):
+            # Support broken = bearish breakout = SHORT signal
+            short_score += 30 + br_support.get("strength", 0) * 20
+            breakout_signal = {
+                "type": "SUPPORT_BREAK",
+                "direction": "SHORT",
+                "strength": br_support.get("strength", 0),
+                "action": "CLOSE_LONG_AND_SHORT",
+            }
+
+        if br_resistance and br_resistance.get("is_confirmed"):
+            # Resistance broken = bullish breakout = LONG signal
+            long_score += 30 + br_resistance.get("strength", 0) * 20
+            breakout_signal = {
+                "type": "RESISTANCE_BREAK",
+                "direction": "LONG",
+                "strength": br_resistance.get("strength", 0),
+                "action": "CLOSE_SHORT_AND_LONG",
+            }
+
+        # Regime-based adjustments
+        regime = market.get("regime", {}).get("regime", "NORMAL")
+        regime_multiplier = 1.0
+        if regime == "TRENDING":
+            regime_multiplier = 1.2  # Boost signals in trends
+        elif regime == "RANGING":
+            regime_multiplier = 0.8  # Reduce in range
+        elif regime == "VOLATILE":
+            regime_multiplier = 0.7  # Be cautious
+
+        # Trend contribution (20 points base)
         if market["macro_trend"]["direction"] == "BULLISH":
             long_score += 20
         if market["macro_trend"]["direction"] == "BEARISH":
             short_score += 20
 
-        # S/R评分贡献（提高权重：score/2，上限35分）
-        # 让特征权重强化学习的结果有更大的话语权
+        # S/R score contribution (higher weight: score/2, max 35)
         if market.get("best_support"):
             distance = abs(price - market["best_support"]["price"]) / price * 100
+            sr_mult = self.regime_adjustments.get("sr_weight_multiplier", 1.0)
             if distance < 3:
-                # 评分58分 → 贡献29分（之前只有15分）
-                long_score += min(35, market["best_support"]["score"] / 2)
+                long_score += min(35, market["best_support"]["score"] / 2 * sr_mult)
             elif distance < 5:
-                # 距离稍远也给一些分数
-                long_score += min(20, market["best_support"]["score"] / 3)
+                long_score += min(20, market["best_support"]["score"] / 3 * sr_mult)
 
         if market.get("best_resistance"):
             distance = abs(price - market["best_resistance"]["price"]) / price * 100
+            sr_mult = self.regime_adjustments.get("sr_weight_multiplier", 1.0)
             if distance < 3:
-                short_score += min(35, market["best_resistance"]["score"] / 2)
+                short_score += min(35, market["best_resistance"]["score"] / 2 * sr_mult)
             elif distance < 5:
-                short_score += min(20, market["best_resistance"]["score"] / 3)
+                short_score += min(20, market["best_resistance"]["score"] / 3 * sr_mult)
 
-        # RSI贡献（降低到10分）
+        # RSI contribution (10 points)
         rsi = analysis.get("rsi", 50)
         if rsi < 35:
             long_score += 10
         if rsi > 65:
             short_score += 10
 
-        # MACD贡献（保持10分）
+        # MACD contribution (10 points)
         if analysis.get("macd_histogram", 0) > 0:
             long_score += 10
         if analysis.get("macd_histogram", 0) < 0:
             short_score += 10
 
-        return {"long": long_score, "short": short_score, "rsi": rsi}
+        # Apply regime multiplier
+        long_score = int(long_score * regime_multiplier)
+        short_score = int(short_score * regime_multiplier)
+
+        return {
+            "long": long_score,
+            "short": short_score,
+            "rsi": rsi,
+            "regime": regime,
+            "breakout_signal": breakout_signal,
+        }
 
     def should_enter(self, market: Dict) -> Optional[Dict]:
         if len(self.positions) >= self.MAX_POSITIONS:
@@ -492,6 +572,23 @@ class TradingAgent:
             return None
         self.last_signal_state = entry_ctx
 
+        # Check for breakout signal (priority over normal entry)
+        breakout_signal = scores.get("breakout_signal")
+        if breakout_signal and breakout_signal.get("strength", 0) > 0.3:
+            direction = breakout_signal["direction"]
+            # Breakout has higher priority
+            return {
+                "direction": direction,
+                "reason": "breakout",
+                "breakout_type": breakout_signal["type"],
+                "scores": scores,
+                "threshold": threshold,
+                "effective_threshold": effective_threshold,
+                "strength": 80 + int(breakout_signal["strength"] * 20),  # 80-100
+                "flip_action": breakout_signal.get("action"),  # For reversal logic
+            }
+
+        # Normal score-based entry
         if scores["long"] >= effective_threshold:
             return {
                 "direction": "LONG",
@@ -511,6 +608,37 @@ class TradingAgent:
                 "strength": scores["short"],
             }
         return None
+
+    def should_flip_position(self, market: Dict, current_pos: Dict) -> Optional[Dict]:
+        """
+        Check if we should close current position and open opposite (breakout reversal)
+        Called when breakout signal appears against current position
+        """
+        scores = self._score_entry(market)
+        breakout_signal = scores.get("breakout_signal")
+
+        if not breakout_signal:
+            return None
+
+        current_dir = current_pos.get("direction", "LONG")
+        signal_dir = breakout_signal.get("direction")
+
+        # Only flip if breakout is against current position
+        if current_dir == signal_dir:
+            return None  # Same direction, no flip needed
+
+        # Check if breakout is strong enough to justify flip
+        if breakout_signal.get("strength", 0) < 0.5:
+            return None  # Not strong enough
+
+        return {
+            "should_flip": True,
+            "close_direction": current_dir,
+            "new_direction": signal_dir,
+            "breakout_type": breakout_signal["type"],
+            "strength": breakout_signal["strength"],
+            "reason": f"Breakout reversal: {breakout_signal['type']}",
+        }
 
     def execute_entry(self, market: Dict, signal: Dict) -> Dict:
         price = market["current_price"]
@@ -812,6 +940,40 @@ class TradingAgent:
             "min_profit_pct": min_profit,
         }
 
+        # 市场状态识别
+        regime_info = self.last_market.get("regime", {})
+        regime_display = {
+            "regime": regime_info.get("regime", "NORMAL"),
+            "confidence": regime_info.get("confidence", 0),
+            "atr_ratio": regime_info.get("atr_ratio", 1.0),
+            "trend_strength": regime_info.get("trend_strength", 0),
+            "adjustments": self.regime_adjustments,
+        }
+
+        # 突破信号
+        breakout_info = None
+        br_support = self.last_market.get("breakout_support", {})
+        br_resistance = self.last_market.get("breakout_resistance", {})
+        if br_support and br_support.get("is_breakout"):
+            breakout_info = {
+                "type": "SUPPORT_BREAK",
+                "confirmed": br_support.get("is_confirmed", False),
+                "direction": "DOWN",
+                "strength": br_support.get("strength", 0),
+                "action": "平多+做空" if br_support.get("is_confirmed") else "观察中",
+            }
+        elif br_resistance and br_resistance.get("is_breakout"):
+            breakout_info = {
+                "type": "RESISTANCE_BREAK",
+                "confirmed": br_resistance.get("is_confirmed", False),
+                "direction": "UP",
+                "strength": br_resistance.get("strength", 0),
+                "action": "平空+做多" if br_resistance.get("is_confirmed") else "观察中",
+            }
+
+        # 离场学习参数
+        exit_learner_info = self.exit_learner.get_exit_params()
+
         return {
             "because": because,
             "therefore": therefore,
@@ -822,5 +984,8 @@ class TradingAgent:
             "north_star": scores.get("north_star", {}),
             "tf_weights": (self.last_market or {}).get("tf_weights"),
             "strategy_params": strategy_params,
+            "regime": regime_display,
+            "breakout": breakout_info,
+            "exit_learner": exit_learner_info,
         }
 

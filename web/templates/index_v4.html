@@ -935,6 +935,7 @@
                             <div class="position-header">
                                 <span class="position-side-${(pos.side || '').toLowerCase()}">${pos.side === 'LONG' ? '多' : '空'}</span>
                                 <span>BTCUSDT</span>
+                                ${pos.source === 'external' ? '<span style="color:#f0b90b;">外部</span>' : ''}
                                 ${pos.tradeId ? `<span style="color:#6c757d;">${pos.tradeId.slice(0,8)}</span>` : ''}
                             </div>
                             <div class="position-details">
@@ -1038,6 +1039,62 @@
                     html += '<div class="logic-title">本次周期权重：</div>';
                     html += `<div class="logic-item">1m: ${(Number(tw['1m'] || 0) * 100).toFixed(1)}% | 15m: ${(Number(tw['15m'] || 0) * 100).toFixed(1)}%</div>`;
                     html += `<div class="logic-item">8h: ${(Number(tw['8h'] || 0) * 100).toFixed(1)}% | 1w: ${(Number(tw['1w'] || 0) * 100).toFixed(1)}%</div>`;
+                    html += '</div>';
+                }
+                
+                // 市场状态识别
+                if (data.ai_logic.regime) {
+                    const rg = data.ai_logic.regime;
+                    const regimeLabels = {
+                        'TRENDING': '趋势行情',
+                        'TRENDING_VOLATILE': '波动趋势',
+                        'RANGING': '震荡行情',
+                        'VOLATILE': '高波动',
+                        'NORMAL': '常规市场',
+                        'UNKNOWN': '未知'
+                    };
+                    const regimeColors = {
+                        'TRENDING': '#0ecb81',
+                        'TRENDING_VOLATILE': '#f0b90b',
+                        'RANGING': '#1890ff',
+                        'VOLATILE': '#f6465d',
+                        'NORMAL': '#848e9c',
+                        'UNKNOWN': '#848e9c'
+                    };
+                    const regimeColor = regimeColors[rg.regime] || '#848e9c';
+                    html += '<div class="logic-section" style="margin-top: 10px; border-top: 1px solid #2b3139; padding-top: 8px;">';
+                    html += '<div class="logic-title">市场状态：</div>';
+                    html += `<div class="logic-item" style="color: ${regimeColor}; font-weight: bold;">${regimeLabels[rg.regime] || rg.regime} (置信度: ${(Number(rg.confidence || 0) * 100).toFixed(0)}%)</div>`;
+                    html += `<div class="logic-item">ATR比率: ${Number(rg.atr_ratio || 1).toFixed(2)} | 趋势强度: ${Number(rg.trend_strength || 0).toFixed(3)}%</div>`;
+                    if (rg.adjustments) {
+                        const adj = rg.adjustments;
+                        html += `<div class="logic-item">阈值调整: ${adj.entry_threshold_delta >= 0 ? '+' : ''}${adj.entry_threshold_delta || 0} | S/R权重倍数: ${Number(adj.sr_weight_multiplier || 1).toFixed(1)}x</div>`;
+                        html += `<div class="logic-item">TP倍数: ${Number(adj.tp_multiplier || 1).toFixed(1)}x | SL倍数: ${Number(adj.sl_multiplier || 1).toFixed(1)}x ${adj.prefer_breakout ? '| 偏好突破' : ''}</div>`;
+                    }
+                    html += '</div>';
+                }
+                
+                // 突破信号
+                if (data.ai_logic.breakout) {
+                    const br = data.ai_logic.breakout;
+                    const breakColor = br.type === 'RESISTANCE_BREAK' ? '#0ecb81' : '#f6465d';
+                    const breakLabel = br.type === 'RESISTANCE_BREAK' ? '阻力突破 (看多)' : '支撑突破 (看空)';
+                    html += '<div class="logic-section" style="margin-top: 10px; border-top: 1px solid #2b3139; padding-top: 8px; background: rgba(240, 185, 11, 0.1);">';
+                    html += '<div class="logic-title" style="color: #f0b90b;">突破信号：</div>';
+                    html += `<div class="logic-item" style="color: ${breakColor}; font-weight: bold;">${breakLabel}</div>`;
+                    html += `<div class="logic-item">强度: ${(Number(br.strength || 0) * 100).toFixed(0)}% | 确认: ${br.confirmed ? '是' : '等待'}</div>`;
+                    html += `<div class="logic-item">操作建议: ${br.action || '-'}</div>`;
+                    html += '</div>';
+                }
+                
+                // 离场学习参数
+                if (data.ai_logic.exit_learner) {
+                    const el = data.ai_logic.exit_learner;
+                    html += '<div class="logic-section" style="margin-top: 10px; border-top: 1px solid #2b3139; padding-top: 8px;">';
+                    html += '<div class="logic-title">离场学习参数：</div>';
+                    html += `<div class="logic-item">快速止盈: ${Number(el.quick_profit_pct || 0.5).toFixed(2)}% | 标准止盈: ${Number(el.normal_profit_pct || 1.0).toFixed(2)}%</div>`;
+                    html += `<div class="logic-item">最大持仓: ${Number(el.max_hold_minutes || 60).toFixed(0)}分 | 追踪止损距离: ${Number(el.trailing_stop_distance || 0.4).toFixed(2)}%</div>`;
+                    html += `<div class="logic-item">离场统计: ${el.profitable_exits || 0}/${el.total_exits || 0} 盈利 (${Number(el.win_rate || 0).toFixed(1)}%)</div>`;
                     html += '</div>';
                 }
                 
