@@ -55,22 +55,22 @@ class LevelDiscovery:
 
     def _consolidation_levels(self, klines: List[Dict], min_touches: int = 3) -> List[float]:
         # 识别价格盘整区域（多次触及的价格）
+        # 短线交易使用更精确的精度
         if len(klines) < 20:
             return []
         levels = set()
-        tolerance = 0.005  # 0.5%容差
         price_touches = {}
         for k in klines:
             for p in [k["high"], k["low"], k["close"]]:
-                rounded = round(p / 50) * 50  # 50美元精度
+                rounded = round(p / 25) * 25  # $25 precision for short-term trading
                 price_touches[rounded] = price_touches.get(rounded, 0) + 1
         for price, count in price_touches.items():
             if count >= min_touches:
                 levels.add(price)
         return list(levels)
 
-    def _volume_profile_levels(self, klines: List[Dict], bucket: int = 50) -> List[float]:
-        # 成交量密集区（增加更多级别）
+    def _volume_profile_levels(self, klines: List[Dict], bucket: int = 25) -> List[float]:
+        # 成交量密集区（$25 精度，适合短线）
         buckets = {}
         for k in klines:
             price = self._round_level(k["close"], bucket)
@@ -109,24 +109,23 @@ class LevelDiscovery:
         candidates.update(self._volume_profile_levels(klines))
         candidates.update(self._recent_high_low(klines, lookback=30))
 
-        # Dynamic band based on volatility (ATR)
+        # Dynamic band based on volatility (ATR) - tighter for short-term
         if max_distance_pct is None:
             if atr and current_price > 0:
-                # 波动率越高，搜索范围越大
-                max_distance_pct = min(max((atr / current_price) * 400, 1.0), 10.0)
+                # 短线交易使用更紧的范围：0.5% ~ 3%
+                max_distance_pct = min(max((atr / current_price) * 200, 0.5), 3.0)
             else:
-                max_distance_pct = 5.0
+                max_distance_pct = 1.5  # Default 1.5% for short-term
 
         def within_band(level: float) -> bool:
             return abs(level - current_price) / current_price * 100 <= max_distance_pct
 
         filtered = [c for c in candidates if within_band(c)]
-        if not filtered:
-            filtered = list(candidates)
-
-        # 增加返回的候选位数量
-        support = sorted([c for c in filtered if c <= current_price])[-12:]
-        resistance = sorted([c for c in filtered if c >= current_price])[:12]
+        # 不再回退到全部候选 - 如果没有符合条件的就返回空
+        # 这表示当前价格附近没有有效的支撑阻力位
+        
+        support = sorted([c for c in filtered if c < current_price])[-5:]  # 最多5个支撑
+        resistance = sorted([c for c in filtered if c > current_price])[:5]  # 最多5个阻力
 
         return {"support": support, "resistance": resistance}
 

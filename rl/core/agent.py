@@ -12,6 +12,7 @@ from ..learning.dynamic_threshold import DynamicThresholdOptimizer
 from ..learning.north_star import NorthStarOptimizer
 from ..learning.strategy_params import StrategyParamLearner
 from ..learning.exit_learner import ExitTimingLearner
+from ..leverage_optimizer import LeverageOptimizer
 from ..market_analysis.indicators import TechnicalAnalyzer
 from ..market_analysis.level_finder import BestLevelFinder, FEATURE_NAMES_CN
 from ..market_analysis.levels import LevelDiscovery, LevelScoring
@@ -41,6 +42,13 @@ class TradingAgent:
         self.data_dir = data_dir
         self.leverage = leverage
         self.base_leverage = leverage
+        self.base_margin_ratio = 0.08  # 8% of available margin
+        # Limit order settings (maker-friendly, with adaptive re-quote)
+        self.limit_offset_pct = 0.0003  # 0.03% maker offset
+        self.limit_cross_offset_pct = 0.0002  # 0.02% cross offset
+        self.limit_requote_seconds = 2
+        self.limit_requote_attempts = 6
+        self.limit_maker_attempts = 3
 
         os.makedirs(data_dir, exist_ok=True)
         self.positions: List[Dict] = []
@@ -66,6 +74,7 @@ class TradingAgent:
         self.batch_manager = BatchPositionManager()
         self.risk = RiskController()
         self.thoughts = ThoughtChain()
+        self.leverage_optimizer = LeverageOptimizer()
 
         # New modules: Market regime & Breakout detection
         self.regime_detector = MarketRegimeDetector()
@@ -88,25 +97,13 @@ class TradingAgent:
     def _get_entry_context(self, market: Dict) -> Dict:
         scores = self._score_entry(market)
         stats = self.trade_logger.get_stats()
-        threshold = self.threshold.compute(
-            stats.get("total_trades", 0), stats.get("win_rate", 0) / 100
-        )
-        north_star = self.north_star.evaluate(stats)
-        aggressive_delta = north_star.get("aggressive_delta", 0)
-        effective_threshold = threshold["threshold"] - aggressive_delta
-        if north_star.get("mode") == "explore":
-            effective_threshold -= 5
-        effective_threshold += self.strategy.get_entry_bias()
-        effective_threshold = max(15, effective_threshold)
-        cooldown = self.entry_cooldown
-        if north_star.get("mode") == "explore":
-            cooldown = max(5, self.entry_cooldown - 5)
+        # 固定阈值50，不再动态调整
+        effective_threshold = 50
         return {
             "scores": scores,
-            "threshold": threshold,
-            "north_star": north_star,
+            "threshold": {"threshold": 50},
             "effective_threshold": effective_threshold,
-            "cooldown": cooldown,
+            "cooldown": self.entry_cooldown,
             "trade_count": stats.get("total_trades", 0),
         }
 
@@ -332,6 +329,114 @@ class TradingAgent:
         rows.sort(key=lambda x: x["contribution_pct"], reverse=True)
         return rows
 
+    def _get_available_margin(self) -> float:
+        try:
+            balances = self.client.get_balance()
+            usdt = next((b for b in balances if b.get("asset") == "USDT"), None)
+            if usdt:
+                return float(usdt.get("availableBalance", usdt.get("balance", 0)))
+        except Exception:
+            pass
+        return 0.0
+
+    def _smart_leverage(self, signal_strength: float, north_star_score: float, stats: Dict) -> int:
+        leverage = float(self.base_leverage)
+        signal_factor = 0.8 + (max(0.0, min(signal_strength, 100.0)) / 100.0) * 0.6
+        ns_factor = 0.8 + (max(0.0, min(north_star_score, 100.0)) / 100.0) * 0.6
+        win_rate = float(stats.get("win_rate", 0)) / 100.0
+        if win_rate >= 0.6:
+            win_factor = 1.1
+        elif win_rate <= 0.35:
+            win_factor = 0.8
+        elif win_rate <= 0.45:
+            win_factor = 0.9
+        else:
+            win_factor = 1.0
+        leverage *= signal_factor * ns_factor * win_factor
+        return max(3, min(50, int(round(leverage))))
+
+    def _smart_position_size(
+        self,
+        price: float,
+        stop_loss: float,
+        signal_strength: float,
+        north_star_score: float,
+        stats: Dict,
+    ) -> Tuple[float, int, float]:
+        available_margin = self._get_available_margin()
+        if available_margin <= 0:
+            return 0.0, self.leverage, 0.0
+        leverage = self._smart_leverage(signal_strength, north_star_score, stats)
+        signal_factor = 0.6 + (max(0.0, min(signal_strength, 100.0)) / 100.0) * 0.4
+        ns_factor = 0.6 + (max(0.0, min(north_star_score, 100.0)) / 100.0) * 0.4
+        margin_ratio = self.base_margin_ratio * signal_factor * ns_factor
+        margin_ratio = max(0.02, min(0.20, margin_ratio))
+        margin_budget = available_margin * margin_ratio
+        notional_budget = margin_budget * leverage
+        qty_by_margin = notional_budget / price if price > 0 else 0.0
+        qty_by_risk = self.position_sizer.calculate_size(
+            available_margin, price, stop_loss
+        )
+        qty = min(qty_by_margin, qty_by_risk)
+        return qty, leverage, margin_budget
+
+    def _calc_limit_price(self, current_price: float, side: str, attempt: int = 0) -> float:
+        use_cross = attempt >= self.limit_maker_attempts
+        if side == "BUY":
+            if use_cross:
+                return current_price * (1 + self.limit_cross_offset_pct)
+            return current_price * (1 - self.limit_offset_pct)
+        if use_cross:
+            return current_price * (1 - self.limit_cross_offset_pct)
+        return current_price * (1 + self.limit_offset_pct)
+
+    def _place_limit_with_requote(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        current_price: float,
+        reduce_only: bool = False,
+    ) -> Optional[Dict]:
+        price = current_price
+        for attempt in range(max(1, self.limit_requote_attempts)):
+            limit_price = self._calc_limit_price(price, side, attempt=attempt)
+            order = self.client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type="LIMIT",
+                quantity=quantity,
+                price=limit_price,
+                time_in_force="GTC",
+                reduce_only=reduce_only,
+            )
+            order_id = order.get("orderId") if isinstance(order, dict) else None
+            time.sleep(self.limit_requote_seconds)
+            if order_id:
+                status = self.client.get_order(symbol, order_id=order_id)
+                if isinstance(status, dict):
+                    order_status = status.get("status", "")
+                    if order_status == "FILLED":
+                        return status
+                    if order_status == "PARTIALLY_FILLED":
+                        # Partially filled - still return it, record what we got
+                        return status
+                    # Try to cancel unfilled order
+                    try:
+                        self.client.cancel_order(symbol, order_id=order_id)
+                    except Exception:
+                        # Cancel failed - check status again, order may have filled
+                        time.sleep(0.5)
+                        recheck = self.client.get_order(symbol, order_id=order_id)
+                        if isinstance(recheck, dict) and recheck.get("status") in ("FILLED", "PARTIALLY_FILLED"):
+                            return recheck
+            try:
+                ticker = self.client.get_ticker_price(symbol)
+                price = float(ticker.get("price", price))
+            except Exception:
+                pass
+        return None
+
     def analyze_market(
         self, kl_1m, kl_15m, kl_8h, kl_1w, orderbook: Optional[Dict] = None
     ) -> Optional[Dict]:
@@ -508,41 +613,69 @@ class TradingAgent:
         elif regime == "VOLATILE":
             regime_multiplier = 0.7  # Be cautious
 
-        # Trend contribution (macro + micro)
+        # Trend contribution (micro > macro for short-term trading)
         macro_dir = market["macro_trend"]["direction"]
         micro_dir = market.get("micro_trend", {}).get("direction")
-        if macro_dir == "BULLISH":
-            long_score += 20
-        if macro_dir == "BEARISH":
-            short_score += 20
+        # Micro trend (15m) has higher weight for short-term trading
         if micro_dir == "BULLISH":
-            long_score += 10
+            long_score += 25
         if micro_dir == "BEARISH":
+            short_score += 25
+        # Macro trend (8h/1w) has lower weight
+        if macro_dir == "BULLISH":
+            long_score += 10
+        if macro_dir == "BEARISH":
             short_score += 10
-        # If macro and micro diverge, reduce the dominant side slightly
+        # If macro and micro diverge, trust micro more (short-term)
         if macro_dir == "BULLISH" and micro_dir == "BEARISH":
-            long_score -= 5
+            long_score -= 10  # Penalize going against micro
             short_score += 5
         if macro_dir == "BEARISH" and micro_dir == "BULLISH":
-            short_score -= 5
+            short_score -= 10  # Penalize going against micro
             long_score += 5
 
-        # S/R score contribution (higher weight: score/2, max 35)
+        # S/R score contribution (tight range for short-term trading)
+        # 核心逻辑：
+        # - 做多：靠近支撑位加分，靠近阻力位减分（上涨空间有限）
+        # - 做空：靠近阻力位加分，靠近支撑位减分（下跌空间有限）
+        
+        support_price = 0
+        resistance_price = 0
+        support_distance_pct = 999
+        resistance_distance_pct = 999
+        
         if market.get("best_support"):
-            distance = abs(price - market["best_support"]["price"]) / price * 100
+            support_price = market["best_support"]["price"]
+            support_distance_pct = abs(price - support_price) / price * 100
             sr_mult = self.regime_adjustments.get("sr_weight_multiplier", 1.0)
-            if distance < 3:
+            # 做多：靠近支撑位加分
+            if support_distance_pct < 0.1:  # Within 0.1% (~$100)
                 long_score += min(35, market["best_support"]["score"] / 2 * sr_mult)
-            elif distance < 5:
+            elif support_distance_pct < 0.3:  # Within 0.3% (~$300)
                 long_score += min(20, market["best_support"]["score"] / 3 * sr_mult)
+            # 做空：靠近支撑位减分（下跌空间有限）
+            if support_distance_pct < 0.1:
+                short_score -= 20  # 惩罚在支撑位附近做空
 
         if market.get("best_resistance"):
-            distance = abs(price - market["best_resistance"]["price"]) / price * 100
+            resistance_price = market["best_resistance"]["price"]
+            resistance_distance_pct = abs(price - resistance_price) / price * 100
             sr_mult = self.regime_adjustments.get("sr_weight_multiplier", 1.0)
-            if distance < 3:
+            # 做空：靠近阻力位加分
+            if resistance_distance_pct < 0.1:  # Within 0.1% (~$100)
                 short_score += min(35, market["best_resistance"]["score"] / 2 * sr_mult)
-            elif distance < 5:
+            elif resistance_distance_pct < 0.3:  # Within 0.3% (~$300)
                 short_score += min(20, market["best_resistance"]["score"] / 3 * sr_mult)
+            # 做多：靠近阻力位减分（上涨空间有限）
+            if resistance_distance_pct < 0.1:
+                long_score -= 20  # 惩罚在阻力位附近做多
+        
+        # 额外检查：如果价格卡在支撑阻力之间的空间太小，两边都减分
+        if support_price > 0 and resistance_price > 0:
+            sr_range_pct = (resistance_price - support_price) / price * 100
+            if sr_range_pct < 0.3:  # 支撑阻力间距 < 0.3%，空间太小
+                long_score -= 15
+                short_score -= 15
 
         # RSI contribution (10 points, 15m)
         rsi = analysis.get("rsi", 50)
@@ -614,8 +747,39 @@ class TradingAgent:
                 "flip_action": breakout_signal.get("action"),  # For reversal logic
             }
 
-        # Normal score-based entry
-        if scores["long"] >= effective_threshold:
+        # Normal score-based entry with trend-aware tie-breaking
+        # MICRO trend takes priority for short-term trading
+        long_ok = scores["long"] >= effective_threshold
+        short_ok = scores["short"] >= effective_threshold
+        if long_ok and short_ok:
+            macro_dir = market.get("macro_trend", {}).get("direction")
+            micro_dir = market.get("micro_trend", {}).get("direction")
+            score_gap = abs(scores["long"] - scores["short"])
+
+            # Priority: 1) Micro trend  2) Score difference  3) Macro trend
+            if micro_dir == "BULLISH":
+                chosen = "LONG"
+            elif micro_dir == "BEARISH":
+                chosen = "SHORT"
+            elif score_gap >= 5:
+                chosen = "LONG" if scores["long"] > scores["short"] else "SHORT"
+            elif macro_dir == "BULLISH":
+                chosen = "LONG"
+            elif macro_dir == "BEARISH":
+                chosen = "SHORT"
+            else:
+                return None  # All signals unclear, don't enter
+
+            return {
+                "direction": chosen,
+                "reason": "score_trend_tiebreak",
+                "scores": scores,
+                "threshold": threshold,
+                "effective_threshold": effective_threshold,
+                "strength": scores["long"] if chosen == "LONG" else scores["short"],
+            }
+
+        if long_ok:
             return {
                 "direction": "LONG",
                 "reason": "score",
@@ -624,7 +788,7 @@ class TradingAgent:
                 "effective_threshold": effective_threshold,
                 "strength": scores["long"],
             }
-        if scores["short"] >= effective_threshold:
+        if short_ok:
             return {
                 "direction": "SHORT",
                 "reason": "score",
@@ -671,21 +835,37 @@ class TradingAgent:
         atr = market["analysis_15m"].get("atr", 0)
         self.sl_tp.update_params(self.strategy.get_sl_tp_params())
         sltp = self.sl_tp.calculate(price, signal["direction"], atr)
-
-        balance = 0.0
-        try:
-            balances = self.client.get_balance()
-            usdt = next((b for b in balances if b.get("asset") == "USDT"), None)
-            if usdt:
-                balance = float(usdt.get("availableBalance", usdt.get("balance", 0)))
-        except Exception:
-            balance = 0.0
-
-        base_qty = self.position_sizer.calculate_size(
-            balance or 100.0, price, sltp["stop_loss"]
+        stats = self.trade_logger.get_stats()
+        north_star = self.north_star.evaluate(stats)
+        signal_strength = float(signal.get("strength", 50))
+        available_margin = self._get_available_margin()
+        if available_margin <= 0:
+            return {"error": "无法获取可用保证金"}
+        base_qty, leverage, margin_budget = self._smart_position_size(
+            price, sltp["stop_loss"], signal_strength, float(north_star.get("score", 0)), stats
         )
+        if base_qty <= 0:
+            return {"error": "计算仓位为0，保证金可能不足"}
         base_qty = max(0.001, round(base_qty, 3))
         base_qty = min(base_qty, 0.5)
+        filters = {}
+        try:
+            filters = self.client.get_symbol_filters("BTCUSDT")
+        except Exception:
+            filters = {}
+        min_qty = float(filters.get("min_qty", 0) or 0)
+        min_notional = float(filters.get("min_notional", 0) or 0)
+        if min_qty > 0 and base_qty < min_qty:
+            return {"error": f"下单数量过小: qty={base_qty}, minQty={min_qty}"}
+        if min_notional > 0 and price * base_qty < min_notional:
+            notional = price * base_qty
+            return {"error": f"名义价值过小: notional={notional:.4f}, minNotional={min_notional}"}
+        if leverage != self.leverage:
+            try:
+                self.client.set_leverage("BTCUSDT", leverage)
+            except Exception:
+                pass
+            self.leverage = leverage
 
         batches = self.batch_manager.plan_entries(signal.get("strength", 50))
         total_batches = max(1, len(batches))
@@ -694,8 +874,13 @@ class TradingAgent:
             if len(self.positions) >= self.MAX_POSITIONS:
                 break
             qty = round(base_qty * batch["ratio"], 3)
-            notional = qty * price / max(1, self.leverage)
-            if balance > 0 and notional > balance * 0.95:
+            # Ensure batch qty meets minimum requirements
+            if qty < min_qty:
+                qty = min_qty
+            if min_notional > 0 and price * qty < min_notional:
+                continue  # Skip this batch if too small
+            margin_estimate = qty * price / max(1, leverage)
+            if available_margin > 0 and margin_estimate > available_margin * 0.9:
                 return {"error": "保证金不足，已跳过入场"}
             if total_batches > 1:
                 tp_scale = 0.7 + 0.3 * (idx / (total_batches - 1))
@@ -713,7 +898,8 @@ class TradingAgent:
                 "quantity": qty,
                 "stop_loss": sltp["stop_loss"],
                 "take_profit": take_profit,
-                "leverage": self.leverage,
+                "leverage": leverage,
+                "margin_used": round(margin_estimate, 4),
                 "timestamp_open": datetime.now().isoformat(),
                 "entry_score": signal.get("strength", 0),
                 "entry_reason": signal.get("reason", ""),
@@ -726,12 +912,18 @@ class TradingAgent:
                 ),
             }
             try:
-                self.client.place_order(
+                side = "BUY" if signal["direction"] == "LONG" else "SELL"
+                order = self._place_limit_with_requote(
                     symbol="BTCUSDT",
-                    side="BUY" if signal["direction"] == "LONG" else "SELL",
-                    order_type="MARKET",
+                    side=side,
                     quantity=position["quantity"],
+                    current_price=price,
                 )
+                if not order:
+                    return {"error": "limit_order_unfilled"}
+                executed_qty = float(order.get("executedQty", position["quantity"]))
+                if executed_qty > 0:
+                    position["quantity"] = round(executed_qty, 3)
             except Exception as exc:
                 return {"error": str(exc)}
 
@@ -760,32 +952,53 @@ class TradingAgent:
         return exits
 
     def execute_exit_position(
-        self, position: Dict, current_price: float, reason: str, confirmations: List[str], skip_api: bool = False
+        self,
+        position: Dict,
+        current_price: float,
+        reason: str,
+        confirmations: List[str],
+        skip_api: bool = False,
+        skip_order: bool = False,
     ) -> Optional[Dict]:
+        if skip_order:
+            skip_api = True
         if not skip_api:
             side = "SELL" if position["direction"] == "LONG" else "BUY"
             try:
-                self.client.place_order(
+                order = self._place_limit_with_requote(
                     symbol="BTCUSDT",
                     side=side,
-                    order_type="MARKET",
                     quantity=position["quantity"],
+                    current_price=current_price,
                     reduce_only=True,
                 )
+                if not order:
+                    return None
             except Exception:
                 pass  # 继续清理本地持仓，即使API失败
 
         entry_price = position["entry_price"]
-        pnl = (
-            (current_price - entry_price) * position["quantity"]
+        qty = position["quantity"]
+        
+        # 计算原始盈亏
+        raw_pnl = (
+            (current_price - entry_price) * qty
             if position["direction"] == "LONG"
-            else (entry_price - current_price) * position["quantity"]
+            else (entry_price - current_price) * qty
         )
-        pnl_percent = (
-            (current_price - entry_price) / entry_price * 100
-            if position["direction"] == "LONG"
-            else (entry_price - current_price) / entry_price * 100
-        )
+        
+        # 计算手续费（限价单0.02%，开仓+平仓各一次）
+        commission_rate = 0.0002  # 0.02% per side
+        entry_commission = entry_price * qty * commission_rate
+        exit_commission = current_price * qty * commission_rate
+        total_commission = entry_commission + exit_commission
+        
+        # 扣除手续费后的净盈亏
+        pnl = raw_pnl - total_commission
+        
+        # 计算百分比（基于入场价值）
+        entry_value = entry_price * qty
+        pnl_percent = (pnl / entry_value * 100) if entry_value > 0 else 0.0
 
         exit_time = datetime.now()
         
@@ -850,8 +1063,10 @@ class TradingAgent:
             "exit_price": current_price,
             "quantity": position["quantity"],
             "leverage": position.get("leverage", self.leverage),
-            "pnl": pnl,
-            "pnl_percent": pnl_percent,
+            "pnl": round(pnl, 4),
+            "pnl_percent": round(pnl_percent, 4),
+            "raw_pnl": round(raw_pnl, 4),  # 扣除手续费前的盈亏
+            "commission": round(total_commission, 4),  # 总手续费
             "exit_reason": reason,
             "timestamp_open": position["timestamp_open"],
             "timestamp_close": exit_time.isoformat(),

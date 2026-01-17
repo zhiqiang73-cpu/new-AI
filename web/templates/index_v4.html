@@ -391,6 +391,14 @@
                 <span class="stat-value" id="balance">$0.00</span>
             </div>
             <div class="header-stat">
+                <span class="stat-label">Account Margin Used</span>
+                <span class="stat-value" id="margin-used">$0.00</span>
+            </div>
+            <div class="header-stat">
+                <span class="stat-label">Account Margin Free</span>
+                <span class="stat-value" id="margin-available">$0.00</span>
+            </div>
+            <div class="header-stat">
                 <span class="stat-label">Unrealized PnL</span>
                 <span class="stat-value" id="unrealized-pnl">$0.00</span>
             </div>
@@ -890,6 +898,15 @@
                         document.getElementById('balance').textContent = `$${usdtBalance.total.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
                     }
                 }
+                if (accountData.margin) {
+                    const margin = accountData.margin || {};
+                    const marginUsed = (margin.initialMargin != null)
+                        ? Number(margin.initialMargin || 0)
+                        : Number((margin.marginBalance || 0) - (margin.availableBalance || 0));
+                    const marginFree = Number(margin.availableBalance || 0);
+                    document.getElementById('margin-used').textContent = `$${marginUsed.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    document.getElementById('margin-available').textContent = `$${marginFree.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                }
                 
                 // 更新持仓
                 const positionsData = await positionsResp.json();
@@ -932,7 +949,7 @@
                                 开仓价: $${pos.entryPrice.toFixed(2)} | 当前价: $${pos.markPrice.toFixed(2)}<br>
                                 数量: ${pos.amount.toFixed(4)} BTC | 杠杆: ${pos.leverage}x<br>
                                 止损: $${(pos.stopLoss || 0).toFixed(2)} | 止盈: $${(pos.takeProfit || 0).toFixed(2)}<br>
-                                强平: $${(pos.liquidationPrice || 0).toFixed(2)}
+                                强平: $${(pos.liquidationPrice || 0).toFixed(2)} | 保证金: $${Number(pos.marginUsed || 0).toFixed(2)}
                             </div>
                             <div class="position-pnl ${pos.pnl >= 0 ? 'positive' : 'negative'}">
                                 盈亏: $${pos.pnl >= 0 ? '+' : ''}${pos.pnl.toFixed(2)} (${pos.pnlPercent >= 0 ? '+' : ''}${pos.pnlPercent.toFixed(2)}%)
@@ -960,6 +977,14 @@
                         if (summary.has_mismatch && summary.note) {
                             html += `<div style="margin: 0 0 6px; color:#f0b90b;">${summary.note}</div>`;
                         }
+                        if (summary.exchange_margin_used != null || summary.agent_margin_used != null) {
+                            html += `
+                                <div style="margin: 0 0 6px; color:#848e9c;">
+                                    交易所持仓保证金合计: $${Number(summary.exchange_margin_used || 0).toFixed(2)} |
+                                    AI持仓保证金合计: $${Number(summary.agent_margin_used || 0).toFixed(2)}
+                                </div>
+                            `;
+                        }
                     }
                     html += '<div style="margin: 6px 0 6px; color: #848e9c;">AI 开仓明细（分批）</div>';
                     html += agentEntries.map(pos => `
@@ -974,7 +999,7 @@
                                 开仓价: $${pos.entryPrice.toFixed(2)} | 当前价: $${pos.markPrice.toFixed(2)}<br>
                                 数量: ${pos.amount.toFixed(4)} BTC | 杠杆: ${pos.leverage}x<br>
                                 止损: $${(pos.stopLoss || 0).toFixed(2)} | 止盈: $${(pos.takeProfit || 0).toFixed(2)}<br>
-                                强平: ${pos.liquidationPrice ? `$${pos.liquidationPrice.toFixed(2)}` : '--'}<br>
+                                强平: ${pos.liquidationPrice ? `$${pos.liquidationPrice.toFixed(2)}` : '--'} | 保证金: $${Number(pos.marginUsed || 0).toFixed(2)}<br>
                                 开仓时间: ${formatTime(pos.timestampOpen)}
                             </div>
                             <div class="position-pnl ${pos.pnl >= 0 ? 'positive' : 'negative'}">

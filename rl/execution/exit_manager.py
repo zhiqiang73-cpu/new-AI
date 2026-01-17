@@ -52,6 +52,111 @@ class ExitManager:
         min_score = float(threshold.get("threshold", market.get("min_score", 0)))
         return long_score, short_score, min_score
 
+    def _check_sr_exit(
+        self, direction: str, current_price: float, pnl_pct: float, market: dict,
+        state: Optional[dict] = None
+    ) -> Optional[ExitDecision]:
+        """
+        紧贴支撑阻力位出场：
+        - 做多：触及阻力位后回落时止盈（卖在高点）
+        - 做空：触及支撑位后反弹时止盈（买在低点）
+        
+        使用 state 记录是否曾触及关键位置
+        """
+        if state is None:
+            state = {}
+            
+        # 获取最佳支撑阻力位
+        best_support = market.get("best_support")
+        best_resistance = market.get("best_resistance")
+        
+        # 触及阈值：0.03%（约$30 @ $100k）- 必须非常接近才算"触及"
+        touch_pct = 0.03
+        # 回落阈值：0.05%（约$50）- 短线精细操作
+        # 加上限价单偏移0.03%，实际范围约$80
+        pullback_pct = 0.05
+        
+        if direction == "LONG":
+            # 做多时，追踪最高价和是否触及阻力
+            max_price = state.get("max_price", current_price)
+            if current_price > max_price:
+                max_price = current_price
+                state["max_price"] = max_price
+            
+            if best_resistance and pnl_pct > 0.3:
+                resistance_price = float(best_resistance.get("price", 0))
+                if resistance_price > 0:
+                    # 检查是否曾触及阻力位（最高价接近阻力）
+                    max_to_resistance_pct = (resistance_price - max_price) / max_price * 100
+                    touched_resistance = max_to_resistance_pct <= touch_pct or max_price >= resistance_price
+                    
+                    if touched_resistance:
+                        state["touched_resistance"] = True
+                        # 检查是否开始回落
+                        pullback_from_max = (max_price - current_price) / max_price * 100
+                        if pullback_from_max >= pullback_pct:
+                            return ExitDecision(
+                                "SR_RESISTANCE_PULLBACK",
+                                [
+                                    f"resistance={resistance_price:.0f}",
+                                    f"max_price={max_price:.0f}",
+                                    f"pullback={pullback_from_max:.2f}%",
+                                    f"pnl={pnl_pct:.2f}%",
+                                ],
+                            )
+                    
+                    # 假突破：突破阻力后回落到阻力下方
+                    if state.get("touched_resistance") and current_price < resistance_price:
+                        if pnl_pct > 0.5:
+                            return ExitDecision(
+                                "SR_FALSE_BREAKOUT",
+                                [
+                                    f"resistance={resistance_price:.0f}",
+                                    f"pnl={pnl_pct:.2f}%",
+                                ],
+                            )
+        else:
+            # 做空时，追踪最低价和是否触及支撑
+            min_price = state.get("min_price", current_price)
+            if current_price < min_price:
+                min_price = current_price
+                state["min_price"] = min_price
+            
+            if best_support and pnl_pct > 0.3:
+                support_price = float(best_support.get("price", 0))
+                if support_price > 0:
+                    # 检查是否曾触及支撑位（最低价接近支撑）
+                    min_to_support_pct = (min_price - support_price) / support_price * 100
+                    touched_support = min_to_support_pct <= touch_pct or min_price <= support_price
+                    
+                    if touched_support:
+                        state["touched_support"] = True
+                        # 检查是否开始反弹
+                        bounce_from_min = (current_price - min_price) / min_price * 100
+                        if bounce_from_min >= pullback_pct:
+                            return ExitDecision(
+                                "SR_SUPPORT_BOUNCE",
+                                [
+                                    f"support={support_price:.0f}",
+                                    f"min_price={min_price:.0f}",
+                                    f"bounce={bounce_from_min:.2f}%",
+                                    f"pnl={pnl_pct:.2f}%",
+                                ],
+                            )
+                    
+                    # 假跌破：跌破支撑后反弹到支撑上方
+                    if state.get("touched_support") and current_price > support_price:
+                        if pnl_pct > 0.5:
+                            return ExitDecision(
+                                "SR_FALSE_BREAKDOWN",
+                                [
+                                    f"support={support_price:.0f}",
+                                    f"pnl={pnl_pct:.2f}%",
+                                ],
+                            )
+        
+        return None
+
     def evaluate(
         self, position: dict, market: dict, current_price: float, state: Optional[dict] = None
     ) -> Optional[ExitDecision]:
@@ -77,6 +182,12 @@ class ExitManager:
 
         if pnl_pct <= -self.params["max_loss_pct"]:
             return ExitDecision("MAX_LOSS", ["max_loss"])
+
+        # ========== 支撑阻力位动态出场 ==========
+        # 紧贴支撑阻力位，抓住波段高低点
+        sr_exit = self._check_sr_exit(direction, current_price, pnl_pct, market, state)
+        if sr_exit:
+            return sr_exit
 
         if state is not None:
             max_pnl = max(state.get("max_pnl_pct", pnl_pct), pnl_pct)

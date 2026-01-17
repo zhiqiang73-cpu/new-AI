@@ -4,22 +4,17 @@ from typing import Dict
 class StopLossTakeProfit:
     def __init__(self, level_scoring=None):
         self.level_scoring = level_scoring
-        self.params = {
-            "default_sl_pct": 0.3,
-            "default_tp_pct": 3.5,
-            "min_risk_reward": 1.5,
-        }
+        # 固定止损1%，止盈2%（风险回报比1:2）
+        self.sl_pct = 0.01  # 1%
+        self.tp_pct = 0.02  # 2%
 
     def update_params(self, params: Dict) -> None:
-        if not params:
-            return
-        for key in ("default_sl_pct", "default_tp_pct", "min_risk_reward"):
-            if key in params:
-                self.params[key] = float(params[key])
+        # 不再动态调整，保持固定
+        pass
 
     def calculate(self, price: float, direction: str, atr: float) -> Dict:
-        sl_pct = max(self.params["default_sl_pct"] / 100, atr / price if atr else 0.003)
-        tp_pct = max(self.params["default_tp_pct"] / 100, sl_pct * self.params["min_risk_reward"])
+        sl_pct = self.sl_pct
+        tp_pct = self.tp_pct
 
         if direction == "LONG":
             stop_loss = price * (1 - sl_pct)

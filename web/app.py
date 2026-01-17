@@ -338,6 +338,7 @@ def account():
     if not client:
         return jsonify({"error": "API keys not configured"}), 400
     try:
+        account_info = client.get_account()
         balances = client.get_balance()
         result = []
         for b in balances:
@@ -349,7 +350,17 @@ def account():
                         "total": float(b.get("balance", 0)),
                     }
                 )
-        return jsonify({"balances": result})
+        margin = {}
+        if isinstance(account_info, dict):
+            margin = {
+                "walletBalance": float(account_info.get("totalWalletBalance", 0)),
+                "marginBalance": float(account_info.get("totalMarginBalance", 0)),
+                "availableBalance": float(account_info.get("totalAvailableBalance", 0)),
+                "initialMargin": float(account_info.get("totalInitialMargin", 0)),
+                "maintMargin": float(account_info.get("totalMaintMargin", 0)),
+                "unrealizedProfit": float(account_info.get("totalUnrealizedProfit", 0)),
+            }
+        return jsonify({"balances": result, "margin": margin})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -457,8 +468,16 @@ def positions():
                     continue
                 diff = exchange_qty - agent_qty
                 if diff > 0.0005:  # Exchange has more
-                    trade_id = f"EXTERNAL-{direction}-{exchange_entry:.2f}-{diff:.4f}"
-                    if any(p.get("trade_id") == trade_id for p in agent_positions_list):
+                    # Use timestamp to ensure unique trade_id
+                    ts = int(datetime.now().timestamp())
+                    trade_id = f"EXTERNAL-{direction}-{ts}"
+                    # Check if we already have an EXTERNAL entry for this direction
+                    existing_external = [p for p in agent_positions_list if p.get("external") and p.get("direction") == direction]
+                    if existing_external:
+                        # Update existing external entry instead of creating new
+                        existing_external[0]["quantity"] = diff
+                        existing_external[0]["entry_price"] = exchange_entry
+                        updated = True
                         continue
                     sl_pct = 0.003
                     tp_pct = 0.035
@@ -485,58 +504,36 @@ def positions():
                         agent_obj.positions.append(external_pos)
                     updated = True
             
-            # Case 2: AI > Exchange - Remove orphaned AI entries
+            # Case 2: AI > Exchange - 按比例缩放 AI 记录以匹配交易所
             for direction, exchange_qty, agent_qty in [
                 ("LONG", exchange_long_qty, agent_long_qty),
                 ("SHORT", exchange_short_qty, agent_short_qty),
             ]:
-                excess = agent_qty - exchange_qty
-                if excess > 0.0005:  # AI has more than exchange
-                    # Remove excess, prioritizing non-external entries first
-                    to_remove = excess
-                    removed = []
-                    
-                    # First, remove non-external entries
-                    for pos in list(agent_positions_list):
-                        if pos.get("direction") != direction:
-                            continue
-                        if pos.get("external"):
-                            continue
-                        if to_remove <= 0:
-                            break
-                        qty = float(pos.get("quantity", 0))
-                        if qty <= to_remove:
-                            agent_positions_list.remove(pos)
-                            removed.append(pos)
-                            to_remove -= qty
-                        else:
-                            # Partial removal
-                            pos["quantity"] = qty - to_remove
-                            to_remove = 0
-                    
-                    # Then, remove external entries if still needed
-                    for pos in list(agent_positions_list):
-                        if pos.get("direction") != direction:
-                            continue
-                        if not pos.get("external"):
-                            continue
-                        if to_remove <= 0:
-                            break
-                        qty = float(pos.get("quantity", 0))
-                        if qty <= to_remove:
-                            agent_positions_list.remove(pos)
-                            removed.append(pos)
-                            to_remove -= qty
-                        else:
-                            pos["quantity"] = qty - to_remove
-                            to_remove = 0
-                    
-                    if removed:
+                if exchange_qty <= 0:
+                    # 交易所无持仓，清空该方向所有记录
+                    to_remove = [p for p in agent_positions_list if p.get("direction") == direction]
+                    for pos in to_remove:
+                        agent_positions_list.remove(pos)
+                    if to_remove:
                         updated = True
-                        add_log(
-                            f"同步清理: {direction}方向多余持仓 {excess:.4f} BTC (已删除{len(removed)}条记录)",
-                            "WARNING",
-                        )
+                        add_log(f"同步清理: {direction}方向无持仓，已清空{len(to_remove)}条记录", "WARNING")
+                elif agent_qty > exchange_qty + 0.0005:
+                    # AI 记录比交易所多，按比例缩放每笔记录
+                    scale_ratio = exchange_qty / agent_qty
+                    direction_positions = [p for p in agent_positions_list if p.get("direction") == direction]
+                    for pos in direction_positions:
+                        old_qty = float(pos.get("quantity", 0))
+                        new_qty = round(old_qty * scale_ratio, 4)
+                        if new_qty < 0.001:
+                            # 数量太小，移除这笔记录
+                            agent_positions_list.remove(pos)
+                        else:
+                            pos["quantity"] = new_qty
+                    updated = True
+                    add_log(
+                        f"同步调整: {direction}方向按比例{scale_ratio:.2%}缩放，交易所={exchange_qty:.4f} AI={agent_qty:.4f}",
+                        "WARNING",
+                    )
             
             # Save if updated
             if updated:
@@ -565,6 +562,11 @@ def positions():
             entry_price = float(p["entryPrice"])
             mark_price = float(p.get("markPrice", entry_price))
             pnl = float(p.get("unRealizedProfit", 0))
+            notional = abs(amt) * mark_price
+            leverage = int(p.get("leverage", 10))
+            margin_used = float(p.get("positionInitialMargin", 0) or p.get("isolatedMargin", 0) or 0)
+            if margin_used <= 0 and leverage > 0:
+                margin_used = notional / leverage
             pnl_percent = (
                 (mark_price - entry_price) / entry_price * 100
                 if direction == "LONG"
@@ -607,7 +609,9 @@ def positions():
                     "markPrice": mark_price,
                     "pnl": pnl,
                     "pnlPercent": round(pnl_percent, 2),
-                    "leverage": int(p.get("leverage", 10)),
+                    "leverage": leverage,
+                    "notional": round(notional, 2),
+                    "marginUsed": round(margin_used, 4),
                     "stopLoss": stop_loss,
                     "takeProfit": take_profit,
                     "liquidationPrice": float(p.get("liquidationPrice", 0) or 0),
@@ -630,6 +634,10 @@ def positions():
                     pnl = (entry_price - mark_price) * qty
                     pnl_percent = (entry_price - mark_price) / entry_price * 100
             leverage = int(ap.get("leverage", 10))
+            notional = abs(qty) * mark_price if mark_price else 0.0
+            margin_used = float(ap.get("margin_used", 0) or 0)
+            if margin_used <= 0 and leverage > 0:
+                margin_used = notional / leverage
             closest_exchange = None
             for ex in active:
                 ex_direction = "LONG" if float(ex["positionAmt"]) > 0 else "SHORT"
@@ -650,6 +658,8 @@ def positions():
                     "pnl": pnl,
                     "pnlPercent": round(pnl_percent, 2),
                     "leverage": leverage,
+                    "notional": round(notional, 2),
+                    "marginUsed": round(margin_used, 4),
                     "stopLoss": ap.get("stop_loss"),
                     "takeProfit": ap.get("take_profit"),
                     "liquidationPrice": None,
@@ -665,6 +675,8 @@ def positions():
         note = ""
         if has_mismatch:
             note = "持仓总量与AI开仓明细不一致，可能存在手动开仓或历史持仓未同步"
+        exchange_margin_used = sum(float(p.get("marginUsed", 0) or 0) for p in result)
+        agent_margin_used = sum(float(p.get("marginUsed", 0) or 0) for p in agent_entries)
         summary = {
             "exchange_qty": round(exchange_qty, 6),
             "agent_qty": round(agent_qty, 6),
@@ -672,6 +684,8 @@ def positions():
             "pct_diff": round(pct_diff, 2),
             "has_mismatch": has_mismatch,
             "note": note,
+            "exchange_margin_used": round(exchange_margin_used, 4),
+            "agent_margin_used": round(agent_margin_used, 4),
         }
         return jsonify(
             {"positions": result, "agent_entries": agent_entries, "summary": summary}
@@ -1041,6 +1055,51 @@ def close_all_positions():
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/commission")
+def get_commission():
+    """获取手续费记录"""
+    client = get_client()
+    if not client:
+        return jsonify({"error": "API keys not configured"}), 400
+    try:
+        # Get recent trades with commission info
+        trades = client.get_account_trades("BTCUSDT", limit=50)
+        if not isinstance(trades, list):
+            trades = []
+        
+        # Get commission income history
+        income = client.get_income_history(income_type="COMMISSION", limit=50)
+        if not isinstance(income, list):
+            income = []
+        
+        # Calculate totals
+        total_commission = sum(abs(float(t.get("commission", 0))) for t in trades)
+        commission_asset = trades[0].get("commissionAsset", "USDT") if trades else "USDT"
+        
+        # Format recent trades
+        recent = []
+        for t in trades[:20]:
+            recent.append({
+                "time": t.get("time"),
+                "symbol": t.get("symbol"),
+                "side": t.get("side"),
+                "price": float(t.get("price", 0)),
+                "qty": float(t.get("qty", 0)),
+                "commission": float(t.get("commission", 0)),
+                "commissionAsset": t.get("commissionAsset", "USDT"),
+                "realizedPnl": float(t.get("realizedPnl", 0)),
+            })
+        
+        return jsonify({
+            "total_commission": round(total_commission, 4),
+            "commission_asset": commission_asset,
+            "recent_trades": recent,
+            "income_history": income[:20],
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.route("/api/sync_positions", methods=["POST"])
 def sync_positions():
     """
@@ -1125,8 +1184,15 @@ def sync_positions():
                     continue
                 diff = exchange_qty - agent_qty
                 if diff > 0.0005:
-                    trade_id = f"EXTERNAL-{direction}-{exchange_entry:.2f}-{diff:.4f}"
-                    if any(p.get("trade_id") == trade_id for p in agent_positions_list):
+                    # Use timestamp to ensure unique trade_id
+                    ts = int(datetime.now().timestamp())
+                    trade_id = f"EXTERNAL-{direction}-{ts}"
+                    # Check if we already have an EXTERNAL entry for this direction
+                    existing_external = [p for p in agent_positions_list if p.get("external") and p.get("direction") == direction]
+                    if existing_external:
+                        # Update existing external entry instead of creating new
+                        existing_external[0]["quantity"] = diff
+                        existing_external[0]["entry_price"] = exchange_entry
                         continue
                     sl_pct = 0.003
                     tp_pct = 0.035
@@ -1153,30 +1219,33 @@ def sync_positions():
                         agent_obj.positions.append(external_pos)
                     updated = True
             
-            # Remove orphaned entries
+            # Case 2: AI > Exchange - 按比例缩放或清空
             removed_count = 0
             for direction, exchange_qty, agent_qty in [
                 ("LONG", exchange_long_qty, agent_long_qty),
                 ("SHORT", exchange_short_qty, agent_short_qty),
             ]:
-                excess = agent_qty - exchange_qty
-                if excess > 0.0005:
-                    to_remove = excess
-                    for pos in list(agent_positions_list):
-                        if pos.get("direction") != direction:
-                            continue
-                        if to_remove <= 0:
-                            break
-                        qty = float(pos.get("quantity", 0))
-                        if qty <= to_remove:
+                if exchange_qty <= 0:
+                    # 交易所无持仓，清空该方向所有记录
+                    to_remove = [p for p in agent_positions_list if p.get("direction") == direction]
+                    for pos in to_remove:
+                        agent_positions_list.remove(pos)
+                        removed_count += 1
+                    if to_remove:
+                        updated = True
+                elif agent_qty > exchange_qty + 0.0005:
+                    # AI 记录比交易所多，按比例缩放
+                    scale_ratio = exchange_qty / agent_qty
+                    direction_positions = [p for p in agent_positions_list if p.get("direction") == direction]
+                    for pos in direction_positions:
+                        old_qty = float(pos.get("quantity", 0))
+                        new_qty = round(old_qty * scale_ratio, 4)
+                        if new_qty < 0.001:
                             agent_positions_list.remove(pos)
                             removed_count += 1
-                            to_remove -= qty
                         else:
-                            pos["quantity"] = qty - to_remove
-                            to_remove = 0
-                    if removed_count > 0:
-                        updated = True
+                            pos["quantity"] = new_qty
+                    updated = True
             
             if updated:
                 if agent_obj and getattr(agent_obj, "positions", None) is not None:

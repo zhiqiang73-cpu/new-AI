@@ -39,30 +39,35 @@ class TradeLogger:
     def log_trade(self, trade: Dict) -> None:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO trades (
-                trade_id, direction, entry_price, exit_price, quantity,
-                leverage, pnl, pnl_percent, exit_reason,
-                timestamp_open, timestamp_close, stop_loss, take_profit
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade.get("trade_id"),
-                trade.get("direction"),
-                trade.get("entry_price"),
-                trade.get("exit_price"),
-                trade.get("quantity"),
-                trade.get("leverage", 10),
-                trade.get("pnl", 0),
-                trade.get("pnl_percent", 0),
-                trade.get("exit_reason", ""),
-                trade.get("timestamp_open"),
-                trade.get("timestamp_close"),
-                trade.get("stop_loss"),
-                trade.get("take_profit"),
-            ),
-        )
+        try:
+            c.execute(
+                """
+                INSERT INTO trades (
+                    trade_id, direction, entry_price, exit_price, quantity,
+                    leverage, pnl, pnl_percent, exit_reason,
+                    timestamp_open, timestamp_close, stop_loss, take_profit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.get("trade_id"),
+                    trade.get("direction"),
+                    trade.get("entry_price"),
+                    trade.get("exit_price"),
+                    trade.get("quantity"),
+                    trade.get("leverage", 10),
+                    trade.get("pnl", 0),
+                    trade.get("pnl_percent", 0),
+                    trade.get("exit_reason", ""),
+                    trade.get("timestamp_open"),
+                    trade.get("timestamp_close"),
+                    trade.get("stop_loss"),
+                    trade.get("take_profit"),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # Avoid crash on duplicate trade_id during bulk close/logging
+            conn.close()
+            return
         conn.commit()
         conn.close()
 

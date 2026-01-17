@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import time
+from decimal import Decimal, ROUND_DOWN
 import requests
 from urllib.parse import urlencode
 from config import TESTNET_BASE_URL, API_KEY, API_SECRET
@@ -18,6 +19,7 @@ class BinanceFuturesClient:
             "X-MBX-APIKEY": self.api_key
         })
         self.time_offset = 0
+        self._symbol_filters = {}
         self._sync_time()
 
     def _sync_time(self):
@@ -150,6 +152,24 @@ class BinanceFuturesClient:
                 return s
         return None
 
+    def get_symbol_filters(self, symbol: str) -> dict:
+        """获取交易对过滤参数（tick/step/minNotional）"""
+        if symbol in self._symbol_filters:
+            return self._symbol_filters[symbol]
+        info = self.get_symbol_info(symbol) or {}
+        filters = {f.get("filterType"): f for f in info.get("filters", [])}
+        price_filter = filters.get("PRICE_FILTER", {})
+        lot_filter = filters.get("LOT_SIZE", {})
+        min_notional = filters.get("MIN_NOTIONAL", {})
+        data = {
+            "tick_size": float(price_filter.get("tickSize", 0) or 0),
+            "step_size": float(lot_filter.get("stepSize", 0) or 0),
+            "min_qty": float(lot_filter.get("minQty", 0) or 0),
+            "min_notional": float(min_notional.get("notional", min_notional.get("minNotional", 0)) or 0),
+        }
+        self._symbol_filters[symbol] = data
+        return data
+
     def place_order(self, symbol: str, side: str, order_type: str, quantity: float,
                     price: float = None, stop_price: float = None, time_in_force: str = None,
                     reduce_only: bool = False):
@@ -158,16 +178,44 @@ class BinanceFuturesClient:
         reduce_only:
             True  -> 只减仓，不会反向开新仓（用于平仓，避免保证金不足）
         """
+        def _round_to_step(value: float, step: float) -> float:
+            if not step or step <= 0:
+                return value
+            d_value = Decimal(str(value))
+            d_step = Decimal(str(step))
+            return float((d_value // d_step) * d_step)
+
         # 获取精度信息
         symbol_info = self.get_symbol_info(symbol)
         if symbol_info:
             qty_precision = symbol_info.get("quantityPrecision", 3)
             price_precision = symbol_info.get("pricePrecision", 2)
-            quantity = round(quantity, qty_precision)
-            if price:
-                price = round(price, price_precision)
-            if stop_price:
-                stop_price = round(stop_price, price_precision)
+            filters = {f.get("filterType"): f for f in symbol_info.get("filters", [])}
+            tick_size = float(filters.get("PRICE_FILTER", {}).get("tickSize", 0) or 0)
+            step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", 0) or 0)
+
+            if step_size > 0:
+                quantity = _round_to_step(quantity, step_size)
+            else:
+                quantity = round(quantity, qty_precision)
+            if price is not None:
+                if tick_size > 0:
+                    price = _round_to_step(price, tick_size)
+                else:
+                    price = round(price, price_precision)
+            if stop_price is not None:
+                if tick_size > 0:
+                    stop_price = _round_to_step(stop_price, tick_size)
+                else:
+                    stop_price = round(stop_price, price_precision)
+
+        # Basic safety checks after rounding
+        if quantity is None or quantity <= 0:
+            raise Exception("订单数量过小，未满足最小步进")
+        if price is not None and price <= 0:
+            raise Exception("订单价格过小，未满足最小跳动")
+        if stop_price is not None and stop_price <= 0:
+            raise Exception("触发价过小，未满足最小跳动")
 
         params = {
             "symbol": symbol,
@@ -220,3 +268,15 @@ class BinanceFuturesClient:
         """获取所有订单历史"""
         params = {"symbol": symbol, "limit": limit}
         return self._request("GET", "/fapi/v1/allOrders", params, signed=True)
+
+    def get_account_trades(self, symbol: str, limit: int = 50):
+        """获取成交历史（包含手续费）"""
+        params = {"symbol": symbol, "limit": limit}
+        return self._request("GET", "/fapi/v1/userTrades", params, signed=True)
+
+    def get_income_history(self, income_type: str = None, limit: int = 100):
+        """获取收益历史（包含手续费、资金费率等）"""
+        params = {"limit": limit}
+        if income_type:
+            params["incomeType"] = income_type  # COMMISSION, FUNDING_FEE, REALIZED_PNL, etc.
+        return self._request("GET", "/fapi/v1/income", params, signed=True)
