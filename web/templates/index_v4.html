@@ -1159,6 +1159,12 @@
                     if (isNaN(dt.getTime())) return ts;
                     return dt.toLocaleString('zh-CN', { hour12: false });
                 };
+                const formatPriceWithPct = (value, entry) => {
+                    if (!value || !entry) return '--';
+                    const pct = ((value - entry) / entry) * 100;
+                    const pctText = `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+                    return `$${value.toFixed(2)} (${pctText})`;
+                };
                 let html = '';
                 
                 if (exchangePositions.length > 0) {
@@ -1173,14 +1179,14 @@
                             <div class="position-details">
                                 开仓价: $${pos.entryPrice.toFixed(2)} | 当前价: $${pos.markPrice.toFixed(2)}<br>
                                 数量: ${pos.amount.toFixed(4)} BTC | 杠杆: ${pos.leverage}x<br>
-                                止损: $${(pos.stopLoss || 0).toFixed(2)} | 止盈: $${(pos.takeProfit || 0).toFixed(2)}<br>
+                                止损: ${formatPriceWithPct(pos.stopLoss || 0, pos.entryPrice)} | 止盈: ${formatPriceWithPct(pos.takeProfit || 0, pos.entryPrice)}<br>
                                 强平: $${(pos.liquidationPrice || 0).toFixed(2)} | 保证金: $${Number(pos.marginUsed || 0).toFixed(2)}
                             </div>
                             <div class="position-pnl ${pos.pnl >= 0 ? 'positive' : 'negative'}">
                                 盈亏: $${pos.pnl >= 0 ? '+' : ''}${pos.pnl.toFixed(2)} (${pos.pnlPercent >= 0 ? '+' : ''}${pos.pnlPercent.toFixed(2)}%)
                             </div>
                             <div class="position-actions">
-                                <button class="btn btn-danger btn-small" onclick="closePosition('${pos.tradeId}', '${pos.symbol}', '${pos.side}', ${pos.amount}, ${pos.entryPrice}, ${pos.leverage})">平仓</button>
+                                <button class="btn btn-danger btn-small" onclick="closePosition('${pos.tradeId}', '${pos.symbol}', '${pos.side}', ${pos.amount}, ${pos.entryPrice}, ${pos.leverage}, '${pos.timestampOpen || ''}')">平仓</button>
                             </div>
                         </div>
                     `).join('');
@@ -1223,7 +1229,7 @@
                             <div class="position-details">
                                 开仓价: $${pos.entryPrice.toFixed(2)} | 当前价: $${pos.markPrice.toFixed(2)}<br>
                                 数量: ${pos.amount.toFixed(4)} BTC | 杠杆: ${pos.leverage}x<br>
-                                止损: $${(pos.stopLoss || 0).toFixed(2)} | 止盈: $${(pos.takeProfit || 0).toFixed(2)}<br>
+                                止损: ${formatPriceWithPct(pos.stopLoss || 0, pos.entryPrice)} | 止盈: ${formatPriceWithPct(pos.takeProfit || 0, pos.entryPrice)}<br>
                                 强平: ${pos.liquidationPrice ? `$${pos.liquidationPrice.toFixed(2)}` : '--'} | 保证金: $${Number(pos.marginUsed || 0).toFixed(2)}<br>
                                 开仓时间: ${formatTime(pos.timestampOpen)}
                             </div>
@@ -1267,7 +1273,7 @@
                     OPPORTUNITY_SWITCH: '机会切换',
                     PROFIT_LOCK: '利润锁定',
                 };
-                
+
                 let html = '';
                 const ai = data.ai_logic || {};
                 const because = Array.isArray(ai.because) ? ai.because : [];
@@ -1290,18 +1296,15 @@
                     html += '</div>';
                 };
 
-                // 简明解释（面向小白的自然语言）
-                const narrativeText = (ai.narrative || '').trim();
-                let simpleLines = [];
-                if (narrativeText) {
-                    const parts = narrativeText.split('。').map(p => p.trim()).filter(Boolean);
-                    simpleLines = parts.slice(0, 3).map(p => `${p}。`);
-                } else {
-                    simpleLines = ['当前信息不足，系统选择观望。'];
-                }
-                addSection('简明解释', simpleLines);
+                const decisionSummary = ai.decision_summary || ai.conclusion || '观望';
+                const decisionReasons = Array.isArray(ai.decision_reasons) ? ai.decision_reasons : [];
+                const decisionBlockers = Array.isArray(ai.decision_blockers) ? ai.decision_blockers : [];
+                addSection('决策概要', [
+                    `当前决策: ${decisionSummary}`,
+                    decisionReasons.length ? `关键依据: ${decisionReasons.join(' | ')}` : '关键依据: -',
+                    decisionBlockers.length ? `阻拦因素: ${decisionBlockers.join(' | ')}` : '阻拦因素: -',
+                ]);
 
-                // 核心判断（最多3段）
                 let regimeLine = '';
                 if (ai.regime) {
                     const rg = ai.regime;
@@ -1311,9 +1314,9 @@
                         'RANGING': '震荡行情',
                         'VOLATILE': '高波动',
                         'NORMAL': '常规市场',
-                        'UNKNOWN': '未知'
+                        'UNKNOWN': '未知',
                     };
-                    regimeLine = `市场: ${regimeLabels[rg.regime] || rg.regime} ${Number(rg.confidence || 0) * 100 >> 0}%`;
+                    regimeLine = `市场结构: ${regimeLabels[rg.regime] || rg.regime} ${Number(rg.confidence || 0) * 100 >> 0}%`;
                 }
 
                 let breakoutLine = '';
@@ -1323,53 +1326,37 @@
                     breakoutLine = `突破: ${breakLabel} ${br.confirmed ? '已确认' : '待确认'} ${Number(br.strength || 0) * 100 >> 0}%`;
                 }
 
-                const thereforeLine = Array.isArray(ai.therefore) && ai.therefore.length
-                    ? ai.therefore.join(' | ')
-                    : '';
-
-                addSection('核心判断', [
-                    `趋势: ${bigTrend} | ${smallTrend}${regimeLine ? ' | ' + regimeLine : ''}`,
-                    `指标: ${rsi} | ${macd}${thereforeLine ? ' | 评分: ' + thereforeLine : ''}`,
-                    `S/R: ${support} | ${resistance}${breakoutLine ? ' | ' + breakoutLine : ''} | 结论: ${ai.conclusion || '观望'}`
+                addSection('市场与结构', [
+                    `趋势: ${bigTrend} | ${smallTrend}`,
+                    `指标: ${rsi} | ${macd}`,
+                    `S/R: ${support} | ${resistance}${regimeLine ? ' | ' + regimeLine : ''}`,
                 ]);
 
-                // 入场/持仓（最多3段）
                 const entry = ai.entry || {};
                 const longScore = Number(entry.long_score || 0);
                 const shortScore = Number(entry.short_score || 0);
                 const thresholdScore = Number(entry.threshold || 0);
-                const bestScore = Math.max(longScore, shortScore);
-                const marketQuality = bestScore >= thresholdScore ? '市场信号偏强' : '市场信号偏弱';
-                const thresholdHint = thresholdScore >= 50 ? '门槛偏高' : '门槛偏低';
-                
-                // 显示形态加分（如果有）
                 let patternHint = '';
                 if (entry.pattern_boost) {
                     const longBoost = Number(entry.pattern_boost.long || 0);
                     const shortBoost = Number(entry.pattern_boost.short || 0);
                     if (longBoost > 0 || shortBoost > 0) {
-                        patternHint = ` | K线形态: 多+${longBoost} 空+${shortBoost}`;
+                        patternHint = ` | 形态加分: 多+${longBoost} 空+${shortBoost}`;
                     }
                 }
-                
-                const entryLine = `入场分数: 多${longScore.toFixed(0)} 空${shortScore.toFixed(0)} 阈值${thresholdScore.toFixed(0)}${patternHint} | ${marketQuality}`;
+                const scoreLine = `评分: 多${longScore.toFixed(0)} 空${shortScore.toFixed(0)} 阈值${thresholdScore.toFixed(0)}${patternHint}`;
+                const entryDecision = Array.isArray(ai.therefore) && ai.therefore.length ? `评分结论: ${ai.therefore.join(' | ')}` : '';
+
                 let lastEntryLine = '';
                 if (entry.last_entry) {
                     const reason = entry.last_entry.reason || '-';
-                    let reasonDetail = '';
-                    if (reason === 'score') {
-                        reasonDetail = '综合分数超过阈值';
-                    } else if (reason === 'breakout') {
-                        reasonDetail = '突破确认触发';
-                    } else {
-                        reasonDetail = reason;
-                    }
                     const dirLabel = entry.last_entry.direction || '-';
-                    const sideScore = dirLabel === 'LONG' ? longScore : shortScore;
-                    lastEntryLine = `最近入场: ${dirLabel} (${Number(entry.last_entry.strength || 0).toFixed(0)}) | 原因: ${reasonDetail} | 分数${sideScore.toFixed(0)}/阈值${thresholdScore.toFixed(0)}`;
+                    lastEntryLine = `最近入场: ${dirLabel} 分数${Number(entry.last_entry.strength || 0).toFixed(0)} | 原因: ${reason}`;
                 } else {
-                    lastEntryLine = '最近入场: - | 原因: -';
+                    lastEntryLine = '最近入场: -';
                 }
+
+                addSection('入场评分', [scoreLine, entryDecision, breakoutLine]);
 
                 let posLine = '';
                 if (Array.isArray(ai.positions) && ai.positions.length > 0) {
@@ -1378,40 +1365,20 @@
                     const pnlVal = Number(p.pnl_percent || 0);
                     const reason = exitReasonMap[p.exit_hint] || (p.exit_hint || '持仓中');
                     const pnlText = `${pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}%`;
-                    let extra = '';
-                    if (p.opportunity) {
-                        const gap = Number(p.opportunity.gap || 0);
-                        extra += ` | 机会差值 ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}`;
-                    }
-                    if (p.time_cost) {
-                        const holdMin = Number(p.time_cost.hold_minutes || 0);
-                        const maxHold = Number(p.time_cost.max_hold || 0);
-                        extra += ` | 时间 ${holdMin.toFixed(0)}/${maxHold.toFixed(0)}分`;
-                    }
-                    posLine = `持仓: ${ai.positions.length}笔 | 首笔${p.direction} 持仓${hold} PnL ${pnlText} | ${reason}${extra}`;
+                    posLine = `持仓: ${ai.positions.length}笔 | 首笔${p.direction} 持仓${hold} PnL ${pnlText} | ${reason}`;
                     if (ai.positions.length > 1) {
                         posLine += ` | 其余${ai.positions.length - 1}笔略`;
                     }
                 } else {
                     posLine = '持仓: 无';
                 }
+                addSection('持仓与执行', [lastEntryLine, posLine]);
 
-                addSection('入场/持仓', [entryLine, lastEntryLine, posLine]);
-
-                // 学习/风控（最多3段）
                 let nsLine = '';
                 if (ai.north_star && Object.keys(ai.north_star).length > 0) {
                     const ns = ai.north_star;
                     nsLine = `北极星: 胜率${Number(ns.win_rate || 0).toFixed(2)}% 盈亏比${Number(ns.profit_factor || 0).toFixed(2)} 夏普${Number(ns.sharpe_ratio || 0).toFixed(3)} 模式${ns.mode || '-'}`;
                 }
-
-                let tfLine = '';
-                if (ai.tf_weights) {
-                    const tw = ai.tf_weights;
-                    tfLine = `周期权重: 1m${(Number(tw['1m'] || 0) * 100).toFixed(1)}% 15m${(Number(tw['15m'] || 0) * 100).toFixed(1)}% 8h${(Number(tw['8h'] || 0) * 100).toFixed(1)}% 1w${(Number(tw['1w'] || 0) * 100).toFixed(1)}%`;
-                }
-
-                let targetLine = '目标: 盈亏比>1.2 夏普>1.0 (稳健) | 进阶目标: 盈亏比>1.5 夏普>1.5';
                 let exitLine = '';
                 if (ai.exit_learner) {
                     const el = ai.exit_learner;
@@ -1426,8 +1393,7 @@
                     const learnLine = `学习: ${data.learning.total_trades}/${data.learning.min_trades_needed} 优化${data.learning.weight_adjustments}次`;
                     exitLine = exitLine ? `${exitLine} | ${learnLine}` : learnLine;
                 }
-
-                addSection('学习/风控', [nsLine, targetLine, exitLine]);
+                addSection('学习与风控', [nsLine, exitLine]);
 
                 container.innerHTML = html;
                 
@@ -1482,6 +1448,8 @@
                     const isActive = trade.is_active ? '（持仓中）' : '';
                     const pnlVal = Number(trade.pnl || 0);
                     const pnlPctVal = Number(trade.pnl_percent || 0);
+                    const rawPnlVal = Number(trade.raw_pnl || 0);
+                    const commissionVal = Number(trade.commission || 0);
                     
                     // 格式化时间显示 (年月日 时:分)
                     let entryTimeStr = '';
@@ -1549,7 +1517,9 @@
                                 开仓: $${trade.entry_price.toFixed(2)} | ${trade.exit_price ? `平仓: $${trade.exit_price.toFixed(2)}` : '持仓中'}<br>
                                 ${exitTimeStr ? `<span style="color: #848e9c;">平仓时间: ${exitTimeStr}</span><br>` : ''}
                                 数量: ${trade.quantity.toFixed(4)} BTC @ ${trade.leverage}x<br>
-                                <span class="trade-pnl ${pnlClass}">盈亏: $${pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)} (${pnlPctVal >= 0 ? '+' : ''}${pnlPctVal.toFixed(2)}%)</span>
+                                <span class="trade-pnl ${pnlClass}">净收益: $${pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)} (${pnlPctVal >= 0 ? '+' : ''}${pnlPctVal.toFixed(2)}%)</span>
+                                <br>
+                                <span style="color:#848e9c;">毛收益: $${rawPnlVal >= 0 ? '+' : ''}${rawPnlVal.toFixed(2)} | 手续费: $${commissionVal.toFixed(4)}</span>
                                 ${trade.exit_reason ? ` | 原因: ${trade.exit_reason}` : ''}
                                 ${patternTags}
                             </div>
@@ -1644,7 +1614,7 @@
         }
         
         // 平仓单个持仓
-        async function closePosition(tradeId, symbol, side, quantity, entryPrice, leverage) {
+        async function closePosition(tradeId, symbol, side, quantity, entryPrice, leverage, timestampOpen) {
             try {
                 const response = await fetch('/api/close', {
                     method: 'POST',
@@ -1655,7 +1625,8 @@
                         side,
                         quantity,
                         entryPrice,
-                        leverage
+                        leverage,
+                        timestamp_open: timestampOpen || null
                     })
                 });
                 

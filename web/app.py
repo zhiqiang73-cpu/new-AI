@@ -515,6 +515,7 @@ def positions():
             trade_id = None
             stop_loss = None
             take_profit = None
+            timestamp_open = None
             closest = None
             for ap in agent_positions:
                 if ap.get("direction") != direction:
@@ -527,6 +528,7 @@ def positions():
                 trade_id = ap.get("trade_id")
                 stop_loss = ap.get("stop_loss")
                 take_profit = ap.get("take_profit")
+                timestamp_open = ap.get("timestamp_open")
 
             if stop_loss is None or take_profit is None:
                 sl_pct = 0.003
@@ -554,7 +556,7 @@ def positions():
                     "stopLoss": stop_loss,
                     "takeProfit": take_profit,
                 "liquidationPrice": _safe_float(p.get("liquidationPrice")),
-                    "timestampOpen": None,
+                    "timestampOpen": timestamp_open,
                 }
             )
         agent_entries = []
@@ -810,6 +812,7 @@ def agent_learning():
 
 @app.route("/api/agent/trades")
 def agent_trades():
+    client = get_client()
     agent = agent_state.get("agent")
     trades = []
     if agent:
@@ -839,11 +842,34 @@ def agent_trades():
             except Exception:
                 active_ids = set()
 
+    # 获取实时价格（多重保底）
+    current_price = 0
+    if agent and agent.last_market:
+        current_price = _safe_float(agent.last_market.get("current_price", 0))
+    if not current_price and client:
+        try:
+            ticker = client.get_ticker_price("BTCUSDT")
+            if ticker:
+                current_price = _safe_float(ticker.get("price"))
+        except Exception:
+            pass
+    if not current_price:
+        # 最后保底：从主网获取
+        try:
+            import requests
+            resp = requests.get("https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": "BTCUSDT"}, timeout=5)
+            if resp.status_code == 200:
+                current_price = _safe_float(resp.json().get("price"))
+        except Exception:
+            pass
+
     formatted = []
     for t in trades:
         trade_id = t.get("trade_id")
         if isinstance(trade_id, str) and trade_id.startswith("EXTERNAL"):
-            continue
+            # Keep manual-close records, skip other external sync-only rows
+            if not trade_id.startswith("EXTERNAL-MANUAL"):
+                continue
         # Parse patterns from JSON string if stored
         patterns_data = t.get("patterns", [])
         if isinstance(patterns_data, str):
@@ -852,81 +878,42 @@ def agent_trades():
             except:
                 patterns_data = []
         
+        entry_price = _safe_float(t.get("entry_price"))
+        qty = _safe_float(t.get("quantity"))
+        pnl = _safe_float(t.get("pnl"))
+        pnl_percent = _safe_float(t.get("pnl_percent"))
+        raw_pnl = _safe_float(t.get("raw_pnl"))
+        commission = _safe_float(t.get("commission"))
+        exit_price_raw = t.get("exit_price")
+        exit_price = _safe_float(exit_price_raw) if exit_price_raw is not None else None
+        
+        # 只显示已平仓的交易（有 exit_price 且不在活跃持仓中）
+        has_exit = exit_price is not None and exit_price > 0
+        is_active = t.get("trade_id") in active_ids
+        if is_active or not has_exit:
+            # 跳过持仓中的记录，历史只显示已平仓的
+            continue
+
         formatted.append(
             {
                 "trade_id": t.get("trade_id"),
                 "direction": t.get("direction"),
-                "entry_price": _safe_float(t.get("entry_price")),
-                "exit_price": _safe_float(t.get("exit_price")) if t.get("exit_price") is not None else None,
-                "quantity": _safe_float(t.get("quantity")),
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "quantity": qty,
                 "leverage": int(t.get("leverage", 10)),
-                "pnl": _safe_float(t.get("pnl")),
-                "pnl_percent": _safe_float(t.get("pnl_percent")),
-                "raw_pnl": _safe_float(t.get("raw_pnl")),
-                "commission": _safe_float(t.get("commission")),
+                "pnl": pnl,
+                "pnl_percent": pnl_percent,
+                "raw_pnl": raw_pnl,
+                "commission": commission,
                 "exit_reason": t.get("exit_reason", ""),
                 "entry_time": t.get("timestamp_open"),
                 "exit_time": t.get("timestamp_close"),
-                "is_active": t.get("trade_id") in active_ids,
+                "is_active": is_active,
                 "patterns": patterns_data,
             }
         )
-    # Add active positions as trades (for markers)
-    active_positions = []
-    current_price = 0
-    if agent and agent.positions:
-        active_positions = [p for p in agent.positions if not p.get("external")]
-        if agent.last_market:
-            current_price = agent.last_market.get("current_price", 0) or 0
-    else:
-        # Read from file when agent is stopped
-        pos_file = os.path.join(RL_DATA_DIR, "active_positions.json")
-        if os.path.exists(pos_file):
-            try:
-                with open(pos_file, "r", encoding="utf-8") as f:
-                    file_data = json.load(f)
-                    active_positions = [p for p in file_data.get("positions", []) if not p.get("external")]
-            except Exception:
-                active_positions = []
-        # Get current price from API
-        try:
-            ticker = client.get_ticker_price("BTCUSDT") if client else None
-            if ticker:
-                current_price = _safe_float(ticker.get("price"))
-        except Exception:
-            current_price = 0
-
-    existing_trade_ids = {t.get("trade_id") for t in formatted}
-    for pos in active_positions:
-        # Skip if already in formatted from trade_logger
-        if pos.get("trade_id") in existing_trade_ids:
-            continue
-        entry_price = _safe_float(pos.get("entry_price"))
-        pnl = 0.0
-        pnl_percent = 0.0
-        if current_price and entry_price:
-            if pos.get("direction") == "LONG":
-                pnl = (current_price - entry_price) * _safe_float(pos.get("quantity"))
-                pnl_percent = (current_price - entry_price) / entry_price * 100
-            else:
-                pnl = (entry_price - current_price) * _safe_float(pos.get("quantity"))
-                pnl_percent = (entry_price - current_price) / entry_price * 100
-        formatted.append(
-            {
-                "trade_id": pos.get("trade_id"),
-                "direction": pos.get("direction"),
-                "entry_price": entry_price,
-                "exit_price": None,
-                "quantity": _safe_float(pos.get("quantity")),
-                "leverage": int(pos.get("leverage", 10)),
-                "pnl": pnl,
-                "pnl_percent": pnl_percent,
-                "exit_reason": "",
-                "entry_time": pos.get("timestamp_open"),
-                "exit_time": None,
-                "is_active": True,
-            }
-        )
+    # 只返回已平仓的交易记录（持仓在 /api/positions 显示）
     return jsonify({"trades": formatted})
 
 
@@ -955,6 +942,17 @@ def daily_report():
         market_state_expr = "market_state" if has_market_state else "''"
         exit_reason_expr = "exit_reason" if has_exit_reason else "''"
 
+        where_clauses = [
+            "(timestamp_close IS NOT NULL AND length(timestamp_close) > 0 AND date(timestamp_close) = ?)",
+            "(timestamp_open IS NOT NULL AND length(timestamp_open) > 0 AND date(timestamp_open) = ?)",
+        ]
+        params = [date_str, date_str]
+        if has_exit_reason:
+            where_clauses.append(
+                "(exit_reason LIKE 'MANUAL_CLOSE%' AND date('now','localtime') = ?)"
+            )
+            params.append(date_str)
+
         c.execute(
             f"""
             SELECT
@@ -968,10 +966,9 @@ def daily_report():
                 timestamp_open,
                 timestamp_close
             FROM trades
-            WHERE (timestamp_close LIKE ?)
-               OR ((timestamp_close IS NULL OR length(timestamp_close) = 0) AND (timestamp_open LIKE ?))
+            WHERE {" OR ".join(where_clauses)}
             """,
-            (f"{date_str}%", f"{date_str}%"),
+            tuple(params),
         )
         rows = c.fetchall()
     finally:
@@ -1107,6 +1104,12 @@ def close_position():
         # 同步AI持仓与交易记录
         agent = agent_state.get("agent")
         trade_id = data.get("tradeId")
+        entry_price = _safe_float(data.get("entryPrice"))
+        leverage = int(_safe_float(data.get("leverage"), 10))
+        timestamp_open = data.get("timestamp_open") or data.get("timestampOpen")
+        matched_pos = None
+        logged_by_agent = False
+
         if agent and trade_id:
             price = None
             try:
@@ -1116,6 +1119,7 @@ def close_position():
             for pos in list(agent.positions):
                 if pos.get("trade_id") != trade_id:
                     continue
+                matched_pos = pos
                 exit_price = price or pos.get("entry_price", 0)
                 trade = agent.execute_exit_position(
                     pos, exit_price, "MANUAL_CLOSE", ["manual_close"], skip_api=True
@@ -1125,7 +1129,94 @@ def close_position():
                         f"手动平仓 {trade['trade_id'][:8]} PnL={trade['pnl']:.2f} ({trade['pnl_percent']:.2f}%)",
                         "INFO",
                     )
+                    logged_by_agent = True
                 break
+        elif agent and not trade_id:
+            # Try matching by direction + entry price when trade_id is missing
+            direction = data.get("side")
+            if direction and agent.positions:
+                closest = None
+                for pos in list(agent.positions):
+                    if pos.get("direction") != direction:
+                        continue
+                    diff = abs(_safe_float(pos.get("entry_price")) - entry_price)
+                    if closest is None or diff < closest["diff"]:
+                        closest = {"diff": diff, "pos": pos}
+                if closest and closest["diff"] < 50:
+                    matched_pos = closest["pos"]
+                    price = None
+                    try:
+                        price = _safe_float(client.get_ticker_price("BTCUSDT").get("price"))
+                    except Exception:
+                        price = None
+                    exit_price = price or matched_pos.get("entry_price", 0)
+                    trade = agent.execute_exit_position(
+                        matched_pos, exit_price, "MANUAL_CLOSE", ["manual_close"], skip_api=True
+                    )
+                    if trade:
+                        add_log(
+                            f"手动平仓 {trade['trade_id'][:8]} PnL={trade['pnl']:.2f} ({trade['pnl_percent']:.2f}%)",
+                            "INFO",
+                        )
+                        logged_by_agent = True
+
+        # 无论是否匹配AI持仓，确保交易历史写入（避免手动平仓漏记）
+        if not logged_by_agent:
+            try:
+                from rl.core.knowledge import TradeLogger
+
+                price = None
+                try:
+                    price = _safe_float(client.get_ticker_price("BTCUSDT").get("price"))
+                except Exception:
+                    price = None
+                exit_price = price or entry_price
+                qty = _safe_float(data.get("quantity"))
+                direction = data.get("side")
+                if not qty:
+                    return jsonify({"success": True, "order": order})
+                raw_pnl = (
+                    (exit_price - entry_price) * qty
+                    if direction == "LONG"
+                    else (entry_price - exit_price) * qty
+                )
+                commission_rate = 0.0005
+                entry_commission = entry_price * qty * commission_rate
+                exit_commission = exit_price * qty * commission_rate
+                total_commission = entry_commission + exit_commission
+                pnl = raw_pnl - total_commission
+                entry_value = entry_price * qty
+                pnl_percent = (pnl / entry_value * 100) if entry_value > 0 else 0.0
+                external_trade_id = trade_id or f"EXTERNAL-MANUAL-{int(time.time())}"
+                trade = {
+                    "trade_id": external_trade_id,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "quantity": qty,
+                    "leverage": leverage,
+                    "pnl": round(pnl, 2),
+                    "pnl_percent": round(pnl_percent, 2),
+                    "raw_pnl": round(raw_pnl, 2),
+                    "commission": round(total_commission, 4),
+                    "exit_reason": "MANUAL_CLOSE",
+                    "timestamp_open": timestamp_open,
+                    "timestamp_close": datetime.now().isoformat(),
+                    "is_win": 1 if pnl > 0 else 0,
+                    "hold_duration_minutes": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "patterns": [],
+                    "market_state": "",
+                    "entry_reason": "manual_close",
+                }
+                TradeLogger(os.path.join(RL_DATA_DIR, "trades.db")).log_trade(trade)
+                add_log(
+                    f"手动平仓记录 {external_trade_id[:8]} PnL={trade['pnl']:.2f} ({trade['pnl_percent']:.2f}%)",
+                    "INFO",
+                )
+            except Exception:
+                pass
         return jsonify({"success": True, "order": order})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400

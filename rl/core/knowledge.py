@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import time
 from typing import Dict, List
 
 
@@ -68,41 +69,103 @@ class TradeLogger:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         try:
-            c.execute(
-                """
-                INSERT INTO trades (
-                    trade_id, direction, entry_price, exit_price, quantity,
-                    leverage, pnl, pnl_percent, exit_reason,
-                    timestamp_open, timestamp_close, is_win, hold_duration_minutes,
-                    stop_loss, take_profit, raw_pnl, commission, patterns,
-                    market_state, entry_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    trade.get("trade_id"),
-                    trade.get("direction"),
-                    trade.get("entry_price"),
-                    trade.get("exit_price"),
-                    trade.get("quantity"),
-                    trade.get("leverage", 10),
-                    trade.get("pnl", 0),
-                    trade.get("pnl_percent", 0),
-                    trade.get("exit_reason", ""),
-                    trade.get("timestamp_open"),
-                    trade.get("timestamp_close"),
-                    trade.get("is_win"),
-                    trade.get("hold_duration_minutes"),
-                    trade.get("stop_loss"),
-                    trade.get("take_profit"),
-                    trade.get("raw_pnl", 0),
-                    trade.get("commission", 0),
-                    json.dumps(trade.get("patterns", []), ensure_ascii=False),
-                    trade.get("market_state", ""),
-                    trade.get("entry_reason", ""),
-                ),
-            )
-        except sqlite3.IntegrityError:
-            # Avoid crash on duplicate trade_id during bulk close/logging
+            trade_id = trade.get("trade_id")
+            existing_id = None
+            existing_close = None
+            if trade_id:
+                c.execute(
+                    "SELECT id, timestamp_close FROM trades WHERE trade_id = ? ORDER BY id DESC LIMIT 1",
+                    (trade_id,),
+                )
+                row = c.fetchone()
+                if row:
+                    existing_id = row[0]
+                    existing_close = row[1]
+
+            if existing_id is not None:
+                exit_reason = trade.get("exit_reason", "") or ""
+                is_partial = "Partial" in exit_reason
+                if is_partial and existing_close:
+                    trade_id = f"{trade_id}-P{int(time.time())}"
+                    existing_id = None
+                else:
+                    c.execute(
+                        """
+                        UPDATE trades SET
+                            exit_price = ?,
+                            quantity = ?,
+                            leverage = ?,
+                            pnl = ?,
+                            pnl_percent = ?,
+                            exit_reason = ?,
+                            timestamp_close = ?,
+                            is_win = ?,
+                            hold_duration_minutes = ?,
+                            stop_loss = ?,
+                            take_profit = ?,
+                            raw_pnl = ?,
+                            commission = ?,
+                            patterns = ?,
+                            market_state = ?,
+                            entry_reason = ?
+                        WHERE trade_id = ?
+                        """,
+                        (
+                            trade.get("exit_price"),
+                            trade.get("quantity"),
+                            trade.get("leverage", 10),
+                            trade.get("pnl", 0),
+                            trade.get("pnl_percent", 0),
+                            exit_reason,
+                            trade.get("timestamp_close"),
+                            trade.get("is_win"),
+                            trade.get("hold_duration_minutes"),
+                            trade.get("stop_loss"),
+                            trade.get("take_profit"),
+                            trade.get("raw_pnl", 0),
+                            trade.get("commission", 0),
+                            json.dumps(trade.get("patterns", []), ensure_ascii=False),
+                            trade.get("market_state", ""),
+                            trade.get("entry_reason", ""),
+                            trade_id,
+                        ),
+                    )
+
+            if existing_id is None:
+                c.execute(
+                    """
+                    INSERT INTO trades (
+                        trade_id, direction, entry_price, exit_price, quantity,
+                        leverage, pnl, pnl_percent, exit_reason,
+                        timestamp_open, timestamp_close, is_win, hold_duration_minutes,
+                        stop_loss, take_profit, raw_pnl, commission, patterns,
+                        market_state, entry_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_id,
+                        trade.get("direction"),
+                        trade.get("entry_price"),
+                        trade.get("exit_price"),
+                        trade.get("quantity"),
+                        trade.get("leverage", 10),
+                        trade.get("pnl", 0),
+                        trade.get("pnl_percent", 0),
+                        trade.get("exit_reason", ""),
+                        trade.get("timestamp_open"),
+                        trade.get("timestamp_close"),
+                        trade.get("is_win"),
+                        trade.get("hold_duration_minutes"),
+                        trade.get("stop_loss"),
+                        trade.get("take_profit"),
+                        trade.get("raw_pnl", 0),
+                        trade.get("commission", 0),
+                        json.dumps(trade.get("patterns", []), ensure_ascii=False),
+                        trade.get("market_state", ""),
+                        trade.get("entry_reason", ""),
+                    ),
+                )
+        except sqlite3.Error:
             conn.close()
             return
         conn.commit()
@@ -113,7 +176,19 @@ class TradeLogger:
             return []
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+        c.execute(
+            """
+            SELECT * FROM trades
+            ORDER BY
+                CASE
+                    WHEN timestamp_close IS NOT NULL AND length(timestamp_close) > 0 THEN timestamp_close
+                    ELSE timestamp_open
+                END DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
         rows = c.fetchall()
         columns = [desc[0] for desc in c.description]
         conn.close()

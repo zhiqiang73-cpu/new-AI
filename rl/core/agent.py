@@ -609,17 +609,33 @@ class TradingAgent:
             features = result["features"]
             breakdown = self._feature_breakdown(features)
             
-            # ========== 距离当前价格更近的S/R获得加分（优先关注近期）==========
-            distance_pct = abs(level - current_price) / current_price * 100
-            # 距离<0.5%时，额外+15分；距离<1%时，额外+8分；距离<1.5%时，额外+3分
+            # ========== 距离评分调整（不硬过滤，通过评分优先选择近距离）==========
+            distance_abs = abs(level - current_price)
+            distance_pct = distance_abs / current_price * 100
+            
+            # 近距离大幅加分，远距离逐步惩罚
+            # 目标：优先选择 200~400 点范围内的 S/R
             proximity_bonus = 0.0
-            if distance_pct < 0.5:
+            if distance_pct < 0.15:
+                # 150 点以内，+30 分
+                proximity_bonus = 30.0
+            elif distance_pct < 0.25:
+                # 150~250 点，+25 分
+                proximity_bonus = 25.0
+            elif distance_pct < 0.4:
+                # 250~400 点，+15 分
                 proximity_bonus = 15.0
-            elif distance_pct < 1.0:
-                proximity_bonus = 8.0
-            elif distance_pct < 1.5:
-                proximity_bonus = 3.0
-            score = base_score + proximity_bonus
+            elif distance_pct < 0.6:
+                # 400~600 点，0 分
+                proximity_bonus = 0.0
+            elif distance_pct < 0.8:
+                # 600~800 点，-20 分
+                proximity_bonus = -20.0
+            else:
+                # 超过 800 点，-50 分
+                proximity_bonus = -50.0
+            
+            score = max(1, base_score + proximity_bonus)  # 最低 1 分，不完全排除
             
             level_scores.append(
                 {
@@ -648,8 +664,9 @@ class TradingAgent:
                         "feature_breakdown": breakdown,
                     }
 
-        # Enforce minimum S/R gap across timeframes (0.3%)
-        min_gap_pct = 0.3
+        # Enforce minimum S/R gap (0.15%) and maximum gap (400 points)
+        min_gap_pct = 0.15  # 最小区间约 142 点
+        max_gap_abs = 400.0  # 最大区间 400 点
         if best_support and best_resistance:
             gap_pct = (best_resistance["price"] - best_support["price"]) / current_price * 100
             if gap_pct < min_gap_pct:
@@ -689,6 +706,47 @@ class TradingAgent:
                             "score": far_support["score"],
                             "features": far_support["features"],
                             "feature_breakdown": far_support["breakdown"],
+                        }
+                    else:
+                        best_support = None
+                        best_resistance = None
+            elif (best_resistance["price"] - best_support["price"]) > max_gap_abs:
+                resistance_candidates = [
+                    ls for ls in level_scores if ls["price"] >= current_price
+                ]
+                resistance_candidates = sorted(
+                    resistance_candidates, key=lambda x: x["score"], reverse=True
+                )
+                max_resistance = best_support["price"] + max_gap_abs
+                near_resistance = next(
+                    (r for r in resistance_candidates if r["price"] <= max_resistance),
+                    None,
+                )
+                if near_resistance:
+                    best_resistance = {
+                        "price": near_resistance["price"],
+                        "score": near_resistance["score"],
+                        "features": near_resistance["features"],
+                        "feature_breakdown": near_resistance["breakdown"],
+                    }
+                else:
+                    support_candidates = [
+                        ls for ls in level_scores if ls["price"] <= current_price
+                    ]
+                    support_candidates = sorted(
+                        support_candidates, key=lambda x: x["score"], reverse=True
+                    )
+                    min_support = best_resistance["price"] - max_gap_abs
+                    near_support = next(
+                        (s for s in support_candidates if s["price"] >= min_support),
+                        None,
+                    )
+                    if near_support:
+                        best_support = {
+                            "price": near_support["price"],
+                            "score": near_support["score"],
+                            "features": near_support["features"],
+                            "feature_breakdown": near_support["breakdown"],
                         }
                     else:
                         best_support = None
@@ -1806,11 +1864,52 @@ class TradingAgent:
             f"阈值: {scores['min_score']:.0f}",
         ]
 
-        conclusion = "观望"
-        if scores["long"] >= scores["min_score"]:
-            conclusion = "多头信号"
-        elif scores["short"] >= scores["min_score"]:
-            conclusion = "空头信号"
+        # ====== 决策状态与原因 ======
+        decision = "观望"
+        intent_dir = None
+        if scores["long"] >= scores["min_score"] and scores["long"] >= scores["short"]:
+            decision = "做多"
+            intent_dir = "LONG"
+        elif scores["short"] >= scores["min_score"] and scores["short"] > scores["long"]:
+            decision = "做空"
+            intent_dir = "SHORT"
+
+        blockers = []
+        startup_elapsed = time.time() - self.start_time
+        if startup_elapsed < 180:
+            blockers.append(f"启动冷却期(剩余{int(180 - startup_elapsed)}s)")
+        cooldown = scores.get("cooldown", self.entry_cooldown)
+        entry_elapsed = time.time() - self._last_entry_time
+        if entry_elapsed < cooldown:
+            blockers.append(f"入场冷却(剩余{int(cooldown - entry_elapsed)}s)")
+        if len(self.positions) >= self.MAX_POSITIONS:
+            blockers.append("达到最大持仓")
+        risk_ok = self.risk.can_trade()
+        if not risk_ok.get("allowed"):
+            reason = risk_ok.get("reason", "risk_limit")
+            risk_label = "日亏损限额" if reason == "daily_loss_limit" else "连续亏损限制"
+            blockers.append(f"风控限制({risk_label})")
+        best_score = max(scores["long"], scores["short"])
+        if best_score < scores["min_score"]:
+            blockers.append(f"最高分{best_score:.0f}<阈值{scores['min_score']:.0f}")
+
+        near_reverse = None
+        if current_price > 0 and intent_dir:
+            threshold_pct = self.near_sr_threshold_pct / 100.0
+            if intent_dir == "LONG" and self.best_resistance:
+                dist = abs(self.best_resistance["price"] - current_price) / current_price
+                if dist <= threshold_pct:
+                    near_reverse = f"靠近阻力({dist*100:.2f}%<=阈值{self.near_sr_threshold_pct:.2f}%)"
+            if intent_dir == "SHORT" and self.best_support:
+                dist = abs(current_price - self.best_support["price"]) / current_price
+                if dist <= threshold_pct:
+                    near_reverse = f"靠近支撑({dist*100:.2f}%<=阈值{self.near_sr_threshold_pct:.2f}%)"
+        if near_reverse:
+            blockers.append(near_reverse)
+
+        decision_summary = decision
+        if blockers:
+            decision_summary = f"{decision}（{blockers[0]}）"
 
         # 生成白话文解读
         narrative_parts = []
@@ -1836,13 +1935,13 @@ class TradingAgent:
             narrative_parts.append(f"下方{dist_s:.2f}%处有支撑，上方{dist_r:.2f}%处有阻力。")
             
         # 4. 决策逻辑
-        if conclusion == "多头信号":
-             narrative_parts.append(f"因多头评分({scores['long']:.0f})突破阈值({scores['min_score']:.0f})，系统决定做多。")
-        elif conclusion == "空头信号":
-             narrative_parts.append(f"因空头评分({scores['short']:.0f})突破阈值({scores['min_score']:.0f})，系统决定做空。")
+        if decision == "做多":
+            narrative_parts.append(f"多头评分({scores['long']:.0f})≥阈值({scores['min_score']:.0f})，当前倾向做多。")
+        elif decision == "做空":
+            narrative_parts.append(f"空头评分({scores['short']:.0f})≥阈值({scores['min_score']:.0f})，当前倾向做空。")
         else:
-             high_score = max(scores['long'], scores['short'])
-             narrative_parts.append(f"最高评分({high_score:.0f})未达阈值({scores['min_score']:.0f})，保持观望。")
+            high_score = max(scores['long'], scores['short'])
+            narrative_parts.append(f"最高评分({high_score:.0f})未达阈值({scores['min_score']:.0f})，保持观望。")
              
         # 5. 预期 (基于数学推演)
         # 即使当前未开仓，也可以基于假设的入场（当前价格）进行推演
@@ -1872,7 +1971,7 @@ class TradingAgent:
         
         narrative_parts.append(f"当前模型推演：盈亏比{rr_str}，预期胜率{win_str}，预计持仓{time_str}。")
 
-        narrative = "".join(narrative_parts)
+        narrative = " ".join(narrative_parts)
 
         # ... (Previous code)
         
@@ -2028,7 +2127,10 @@ class TradingAgent:
         return {
             "because": because,
             "therefore": therefore,
-            "conclusion": conclusion,
+            "conclusion": decision,
+            "decision_summary": decision_summary,
+            "decision_reasons": narrative_parts[:3],
+            "decision_blockers": blockers,
             "narrative": narrative,
             "entry": entry_info,
             "positions": positions,
@@ -2039,5 +2141,6 @@ class TradingAgent:
             "regime": regime_display,
             "breakout": breakout_info,
             "exit_learner": exit_learner_info,
+            "near_sr_threshold_pct": self.near_sr_threshold_pct,
         }
 
