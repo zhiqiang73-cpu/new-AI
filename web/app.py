@@ -41,7 +41,7 @@ agent_state = {
     "logs": deque(maxlen=200),
     "last_update": None,
     "last_stop_reason": None,
-    "config": {"leverage": 10},
+    "config": {"leverage": 10, "near_sr_threshold_pct": 0.1},
 }
 
 
@@ -174,8 +174,10 @@ def run_agent_loop():
         agent_state["running"] = False
         return
 
-    leverage = agent_state.get("config", {}).get("leverage", 10)
+    config = agent_state.get("config", {})
+    leverage = config.get("leverage", 10)
     agent = TradingAgent(client, data_dir=RL_DATA_DIR, leverage=leverage)
+    agent.near_sr_threshold_pct = float(config.get("near_sr_threshold_pct", 0.1) or 0.1)
     agent_state["agent"] = agent
     add_log("Agent已启动", "SUCCESS")
     
@@ -608,10 +610,9 @@ def positions():
         agent_qty = sum(_safe_float(p.get("quantity")) for p in agent_positions)
         qty_diff = exchange_qty - agent_qty
         pct_diff = (qty_diff / exchange_qty * 100) if exchange_qty else 0.0
-        has_mismatch = exchange_qty > 0 and abs(pct_diff) >= 1.0
+        # 禁用总量不一致提醒：仅展示当前持仓数据
+        has_mismatch = False
         note = ""
-        if has_mismatch:
-            note = "持仓总量与AI开仓明细不一致，可能存在手动开仓或历史持仓未同步"
         exchange_margin_used = sum(_safe_float(p.get("marginUsed") or 0) for p in result)
         agent_margin_used = sum(_safe_float(p.get("marginUsed") or 0) for p in agent_entries)
         summary = {
@@ -733,6 +734,34 @@ def agent_status():
         except Exception:
             pass
     return jsonify(status)
+
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    if request.method == "GET":
+        return jsonify(agent_state.get("config", {}))
+
+    data = request.get_json(silent=True) or {}
+    config = agent_state.get("config", {})
+
+    if "near_sr_threshold_pct" in data:
+        try:
+            val = float(data.get("near_sr_threshold_pct"))
+            # 合理范围：0.01% - 0.50%
+            if val < 0.01:
+                val = 0.01
+            if val > 0.5:
+                val = 0.5
+            config["near_sr_threshold_pct"] = val
+        except Exception:
+            pass
+
+    agent_state["config"] = config
+    agent = agent_state.get("agent")
+    if agent is not None:
+        agent.near_sr_threshold_pct = float(config.get("near_sr_threshold_pct", 0.1) or 0.1)
+
+    return jsonify(config)
 
 
 @app.route("/api/agent/logs")

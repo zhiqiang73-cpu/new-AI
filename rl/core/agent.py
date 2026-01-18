@@ -108,6 +108,7 @@ class TradingAgent:
         self.last_entry_plan = []
         self.last_entry_signal = None
         self.start_time = time.time()  # Agent startup time
+        self.near_sr_threshold_pct = 0.1
 
     def _get_entry_context(self, market: Dict) -> Dict:
         scores = self._score_entry(market)
@@ -604,13 +605,28 @@ class TradingAgent:
                 tf_weights,
                 extra_features=extra_features,
             )
-            score = result["score"]
+            base_score = result["score"]
             features = result["features"]
             breakdown = self._feature_breakdown(features)
+            
+            # ========== 距离当前价格更近的S/R获得加分（优先关注近期）==========
+            distance_pct = abs(level - current_price) / current_price * 100
+            # 距离<0.5%时，额外+15分；距离<1%时，额外+8分；距离<1.5%时，额外+3分
+            proximity_bonus = 0.0
+            if distance_pct < 0.5:
+                proximity_bonus = 15.0
+            elif distance_pct < 1.0:
+                proximity_bonus = 8.0
+            elif distance_pct < 1.5:
+                proximity_bonus = 3.0
+            score = base_score + proximity_bonus
+            
             level_scores.append(
                 {
                     "price": level,
                     "score": score,
+                    "base_score": base_score,
+                    "proximity_bonus": proximity_bonus,
                     "features": features,
                     "breakdown": breakdown,
                 }
@@ -1025,10 +1041,31 @@ class TradingAgent:
                 "rr_ratio": 1.5
             }
 
-    def _can_add_position(self, direction: str, current_price: float) -> bool:
+    def _build_signal_key(self, direction: str, reason: str, scores: Dict) -> str:
+        patterns = scores.get("patterns") or []
+        pattern_ids = []
+        for p in patterns:
+            name = p.get("name", "")
+            p_dir = p.get("direction", "")
+            if name or p_dir:
+                pattern_ids.append(f"{name}:{p_dir}")
+        pattern_key = ",".join(sorted(set(pattern_ids)))
+        breakout = scores.get("breakout_signal") or {}
+        breakout_type = breakout.get("type", "")
+        return f"{direction}|{reason}|{breakout_type}|{pattern_key}"
+
+    def _can_add_position(
+        self,
+        direction: str,
+        current_price: float,
+        signal_strength: Optional[float] = None,
+        signal_key: Optional[str] = None,
+    ) -> bool:
         """
         检查是否允许加仓（分批建仓过滤器）
-        规则：必须满足 (时间间隔 > 3分钟) 或 (价格差距 > 0.2%)
+        规则：
+        1) 默认：必须满足 (时间间隔 > 3分钟) 或 (价格差距 > 0.2%)
+        2) 同一信号：必须间隔足够时间且信号更强才允许加仓
         """
         same_dir_pos = [p for p in self.positions if p.get("direction") == direction]
         if not same_dir_pos:
@@ -1048,6 +1085,19 @@ class TradingAgent:
             
             MIN_INTERVAL = 180  # 3分钟
             MIN_PRICE_GAP = 0.002 # 0.2%
+            MIN_STRENGTH_DELTA = 5  # 同一信号需明显更强
+
+            # 同一信号只开一笔：必须间隔足够时间且信号更强
+            last_signal = self.last_entry_signal or {}
+            if signal_key and last_signal and last_signal.get("direction") == direction:
+                last_key = last_signal.get("signal_key")
+                if last_key == signal_key:
+                    last_strength = float(last_signal.get("strength") or 0)
+                    if time_diff < MIN_INTERVAL:
+                        return False
+                    if signal_strength is None or signal_strength < last_strength + MIN_STRENGTH_DELTA:
+                        return False
+                    return True
             
             # 如果既没有在这个价格停留够久，价格也没有显著变化，则禁止加仓
             if time_diff < MIN_INTERVAL and price_diff_pct < MIN_PRICE_GAP:
@@ -1116,6 +1166,14 @@ class TradingAgent:
             
             # 至少2项确认才允许入场（降低错过短线突破的概率）
             if confirms >= 2:
+                signal_key = self._build_signal_key(direction, "breakout_confirmed", scores)
+                if not self._can_add_position(
+                    direction,
+                    market["current_price"],
+                    signal_strength=80 + int(breakout_signal["strength"] * 20),
+                    signal_key=signal_key,
+                ):
+                    return None
                 return {
                     "direction": direction,
                     "reason": "breakout_confirmed",
@@ -1127,6 +1185,7 @@ class TradingAgent:
                     "flip_action": breakout_signal.get("action"),
                     "confirmations": confirmations_list,
                     "confirm_count": confirms,
+                    "signal_key": signal_key,
                 }
             # 确认不足，降级为普通评分入场（突破信号仍加分，但需要满足阈值）
 
@@ -1185,9 +1244,21 @@ class TradingAgent:
                 return None  # All signals unclear, don't enter
 
             decision_features = scores.get("decision_features", {}).get(chosen.lower(), {})
+            sr_snapshot = {
+                "support": (market.get("best_support") or {}).get("price"),
+                "resistance": (market.get("best_resistance") or {}).get("price"),
+                "timestamp": datetime.now().isoformat(),
+            }
             
-            # 分批建仓检查
-            if not self._can_add_position(chosen, market["current_price"]):
+            # 分批建仓检查（同一信号只开一笔）
+            strength = scores["long"] if chosen == "LONG" else scores["short"]
+            signal_key = self._build_signal_key(chosen, "score_trend_tiebreak", scores)
+            if not self._can_add_position(
+                chosen,
+                market["current_price"],
+                signal_strength=strength,
+                signal_key=signal_key,
+            ):
                 return None
 
             return {
@@ -1196,13 +1267,26 @@ class TradingAgent:
                 "scores": scores,
                 "threshold": threshold,
                 "effective_threshold": effective_threshold,
-                "strength": scores["long"] if chosen == "LONG" else scores["short"],
+                "strength": strength,
                 "patterns": scores.get("patterns"),
                 "decision_features": decision_features,
+                "signal_key": signal_key,
+                "sr_snapshot": sr_snapshot,
             }
 
         if long_ok:
-            if not self._can_add_position("LONG", market["current_price"]):
+            sr_snapshot = {
+                "support": (market.get("best_support") or {}).get("price"),
+                "resistance": (market.get("best_resistance") or {}).get("price"),
+                "timestamp": datetime.now().isoformat(),
+            }
+            signal_key = self._build_signal_key("LONG", "score", scores)
+            if not self._can_add_position(
+                "LONG",
+                market["current_price"],
+                signal_strength=scores["long"],
+                signal_key=signal_key,
+            ):
                 return None
             return {
                 "direction": "LONG",
@@ -1213,9 +1297,22 @@ class TradingAgent:
                 "strength": scores["long"],
                 "patterns": scores.get("patterns"),
                 "decision_features": scores.get("decision_features", {}).get("long", {}),
+                "signal_key": signal_key,
+                "sr_snapshot": sr_snapshot,
             }
         if short_ok:
-            if not self._can_add_position("SHORT", market["current_price"]):
+            sr_snapshot = {
+                "support": (market.get("best_support") or {}).get("price"),
+                "resistance": (market.get("best_resistance") or {}).get("price"),
+                "timestamp": datetime.now().isoformat(),
+            }
+            signal_key = self._build_signal_key("SHORT", "score", scores)
+            if not self._can_add_position(
+                "SHORT",
+                market["current_price"],
+                signal_strength=scores["short"],
+                signal_key=signal_key,
+            ):
                 return None
             return {
                 "direction": "SHORT",
@@ -1226,6 +1323,8 @@ class TradingAgent:
                 "strength": scores["short"],
                 "patterns": scores.get("patterns"),
                 "decision_features": scores.get("decision_features", {}).get("short", {}),
+                "signal_key": signal_key,
+                "sr_snapshot": sr_snapshot,
             }
         return None
 
@@ -1262,6 +1361,19 @@ class TradingAgent:
 
     def execute_entry(self, market: Dict, signal: Dict) -> Dict:
         price = market["current_price"]
+        # ====== Scheme C: 决策使用快照，下单前用最新SR再校验 ======
+        current_market = self.last_market or market
+        current_support = (current_market.get("best_support") or {}).get("price")
+        current_resistance = (current_market.get("best_resistance") or {}).get("price")
+        near_threshold_pct = float(getattr(self, "near_sr_threshold_pct", 0.1) or 0.1)
+        if signal.get("direction") == "LONG" and current_resistance:
+            dist_pct = abs(float(current_resistance) - price) / price * 100 if price > 0 else 0.0
+            if dist_pct <= near_threshold_pct:
+                return {"error": f"靠近阻力位({near_threshold_pct:.2f}%)，已阻止做多入场"}
+        if signal.get("direction") == "SHORT" and current_support:
+            dist_pct = abs(price - float(current_support)) / price * 100 if price > 0 else 0.0
+            if dist_pct <= near_threshold_pct:
+                return {"error": f"靠近支撑位({near_threshold_pct:.2f}%)，已阻止做空入场"}
         atr = self._safe_float_with_last(
             "atr_15m",
             market["analysis_15m"].get("atr"),
@@ -1281,6 +1393,15 @@ class TradingAgent:
         )
         if base_qty <= 0:
             return {"error": "计算仓位为0，保证金可能不足"}
+        
+        # ========== 确保始终提取决策特征（在仓位计算前）==========
+        decision_features = signal.get("decision_features", {})
+        if not decision_features:
+            # 如果信号中没有决策特征，从市场数据重新提取
+            decision_features = self.decision_learner.extract_features(
+                market, signal["direction"]
+            )
+        
         # Feature-driven position sizing (same-feature reinforcement)
         size_factor = self.feature_outcome.entry_size_factor(decision_features)
         base_qty = base_qty * size_factor
@@ -1323,14 +1444,6 @@ class TradingAgent:
         stop_loss = sltp["stop_loss"]
             
         trade_id = str(uuid.uuid4())
-            
-        # ========== 确保始终提取决策特征 ==========
-        decision_features = signal.get("decision_features", {})
-        if not decision_features:
-            # 如果信号中没有决策特征，从市场数据重新提取
-            decision_features = self.decision_learner.extract_features(
-                market, signal["direction"]
-            )
         
         position = {
             "trade_id": trade_id,

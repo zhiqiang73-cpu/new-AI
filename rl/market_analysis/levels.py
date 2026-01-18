@@ -81,8 +81,8 @@ class LevelDiscovery:
         top = sorted(buckets.items(), key=lambda x: x[1], reverse=True)[:8]
         return [p for p, _ in top]
 
-    def _recent_high_low(self, klines: List[Dict], lookback: int = 20) -> List[float]:
-        # 最近N根K线的最高最低点
+    def _recent_high_low(self, klines: List[Dict], lookback: int = 50) -> List[float]:
+        # 最近N根K线的最高最低点（优先关注近期数据）
         if len(klines) < lookback:
             lookback = len(klines)
         recent = klines[-lookback:]
@@ -104,13 +104,20 @@ class LevelDiscovery:
         current_price = current_price or prices[-1]
 
         candidates = set()
-        # 多种方法发现候选位
-        candidates.update(self._integer_levels(prices))
-        candidates.update(self._swing_levels(klines, window=5))
-        candidates.update(self._fractal_levels(klines, window=3))
-        candidates.update(self._consolidation_levels(klines, min_touches=3))
-        candidates.update(self._volume_profile_levels(klines))
-        candidates.update(self._recent_high_low(klines, lookback=30))
+        # 多种方法发现候选位（优先关注近期K线）
+        # 1. 最近50根K线的局部高低点（最重要）
+        recent_hl = self._recent_high_low(klines, lookback=50)
+        candidates.update(recent_hl)
+        # 2. 最近100根K线的成交量密集区
+        recent_klines = klines[-100:] if len(klines) >= 100 else klines
+        candidates.update(self._volume_profile_levels(recent_klines))
+        # 3. 近期摆动点（缩小窗口，更敏感）
+        candidates.update(self._swing_levels(recent_klines, window=3))
+        candidates.update(self._fractal_levels(recent_klines, window=3))
+        # 4. 近期整理区间（降低最小触及次数，更敏感）
+        candidates.update(self._consolidation_levels(recent_klines, min_touches=2))
+        # 5. 整数位（辅助，但权重低）
+        candidates.update(self._integer_levels(prices[-100:]))
 
         # ========== Level Merging: 合并相近能级 ==========
         def merge_nearby(levels: List[float], tolerance_pct: float = 0.2) -> List[float]:
@@ -135,22 +142,23 @@ class LevelDiscovery:
         
         candidates = merge_nearby(list(candidates), tolerance_pct=0.2)
 
-        # Dynamic band（扩大搜索范围，匹配止盈需求）
+        # Dynamic band（缩小搜索范围，更关注近期S/R）
         if max_distance_pct is None:
             if atr and current_price > 0:
-                # 扩大到2%-6%，为止盈提供足够空间
+                # 缩小到0.5%-1.0%，更贴近当前价格
                 atr_pct = (atr / current_price) * 100
-                max_distance_pct = min(max(atr_pct * 250, 2.0), 6.0)
+                max_distance_pct = min(max(atr_pct * 50, 0.5), 1.0)
             else:
-                max_distance_pct = 3.0  # Default 3%
+                max_distance_pct = 0.5  # Default 0.5%（约475 USDT @ 95k）
 
         def within_band(level: float) -> bool:
             return abs(level - current_price) / current_price * 100 <= max_distance_pct
 
         filtered = [c for c in candidates if within_band(c)]
         
-        support = sorted([c for c in filtered if c < current_price])[-3:]  # 只取3个最强支撑
-        resistance = sorted([c for c in filtered if c > current_price])[:3]  # 只取3个最强阻力
+        # 选择最强的S/R（按后续评分排序），距离只是加分项
+        support = sorted([c for c in filtered if c < current_price], reverse=True)[:3]  # 取3个最强支撑
+        resistance = sorted([c for c in filtered if c > current_price])[:3]  # 取3个最强阻力
 
         # ========== 强制最小间距：确保交易空间 ==========
         # 降低到0.3%（用户要求，更适合短线）

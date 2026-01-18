@@ -452,6 +452,34 @@
                     <div class="no-data">暂无持仓</div>
                 </div>
             </div>
+
+            <!-- 参数设置 -->
+            <div class="card collapsed" id="config-card" style="min-height: 140px;">
+                <div class="card-header clickable" onclick="toggleConfigCard()">
+                    参数设置
+                    <span class="collapse-indicator" id="config-toggle-text">点击展开</span>
+                </div>
+                <div class="card-body" id="config-container">
+                    <div style="font-size: 12px; color: #eaecef; margin-bottom: 6px;">
+                        靠近反向位阈值（%）
+                    </div>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        <input
+                            type="number"
+                            id="near-sr-threshold"
+                            min="0.01"
+                            max="0.5"
+                            step="0.01"
+                            value="0.1"
+                            style="width: 80px; background: #1e2329; color: #eaecef; border: 1px solid #2b3139; padding: 4px 6px; border-radius: 4px;"
+                        />
+                        <button class="btn btn-small" onclick="saveConfig()">保存</button>
+                    </div>
+                    <div style="font-size: 11px; color: #848e9c; margin-top: 6px;">
+                        距离≤该值时，阻止反向入场
+                    </div>
+                </div>
+            </div>
             
             <!-- AI决策逻辑 -->
             <div class="card" style="flex: 1; min-height: 300px; max-height: 500px;">
@@ -601,8 +629,31 @@
                     wickDownColor: '#f6465d',
                 });
                 
+                // 添加成交量系列（占用K线图下方约10%空间，清晰可见）
+                const volume = chart.addHistogramSeries({
+                    priceFormat: {
+                        type: 'volume',
+                    },
+                    priceScaleId: 'volume',
+                    scaleMargins: {
+                        top: 0.90,  // 顶部90%，占用底部10%空间
+                        bottom: 0,
+                    },
+                    color: '#26a69a',
+                });
+                
+                // 设置成交量价格刻度（占用底部10%空间）
+                chart.priceScale('volume').applyOptions({
+                    scaleMargins: {
+                        top: 0.90,  // 顶部90%，占用底部10%空间
+                        bottom: 0,
+                    },
+                    entireTextOnly: false,
+                });
+                
                 charts[interval] = chart;
                 candlestickSeries[interval] = candlestick;
+                volumeSeries[interval] = volume;
                 
                 // 初始化支撑阻力线数组（只for 1m和15m）
                 if (interval === '1m' || interval === '15m') {
@@ -644,6 +695,20 @@
                         
                         // 更新K线
                         candlestickSeries[interval].setData(candlesWithLocalTime);
+                        
+                        // 更新成交量（如果存在）
+                        if (klineData.volumes && volumeSeries[interval]) {
+                            const volumesWithLocalTime = klineData.volumes.map((vol, idx) => {
+                                const candle = candlesWithLocalTime[idx];
+                                const color = candle && candle.close >= candle.open ? '#26a69a' : '#ef5350';
+                                return {
+                                    time: vol.time + SHANGHAI_OFFSET,
+                                    value: vol.value,
+                                    color: vol.color || color,
+                                };
+                            });
+                            volumeSeries[interval].setData(volumesWithLocalTime);
+                        }
                         
                         // 更新价格显示
                         const lastCandle = klineData.candles[klineData.candles.length - 1];
@@ -770,6 +835,75 @@
             if (!card || !text) return;
             const collapsed = card.classList.toggle('collapsed');
             text.textContent = collapsed ? '点击展开' : '点击收起';
+        }
+
+        // 参数设置卡片折叠控制
+        function toggleConfigCard() {
+            const card = document.getElementById('config-card');
+            const text = document.getElementById('config-toggle-text');
+            if (!card || !text) return;
+            const collapsed = card.classList.toggle('collapsed');
+            text.textContent = collapsed ? '点击展开' : '点击收起';
+            try {
+                localStorage.setItem('configCardCollapsed', collapsed ? '1' : '0');
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        function initConfigCard() {
+            const card = document.getElementById('config-card');
+            const text = document.getElementById('config-toggle-text');
+            if (!card || !text) return;
+            let collapsed = true;
+            try {
+                collapsed = localStorage.getItem('configCardCollapsed') !== '0';
+            } catch (error) {
+                collapsed = true;
+            }
+            if (collapsed) {
+                card.classList.add('collapsed');
+                text.textContent = '点击展开';
+            } else {
+                card.classList.remove('collapsed');
+                text.textContent = '点击收起';
+            }
+        }
+
+        async function loadConfig() {
+            try {
+                const res = await fetch('/api/config');
+                const data = await res.json();
+                const input = document.getElementById('near-sr-threshold');
+                if (input && data && data.near_sr_threshold_pct != null) {
+                    input.value = Number(data.near_sr_threshold_pct).toFixed(2);
+                }
+            } catch (error) {
+                console.error('Failed to load config:', error);
+            }
+        }
+
+        async function saveConfig() {
+            const input = document.getElementById('near-sr-threshold');
+            if (!input) return;
+            const val = Number(input.value);
+            if (!val || val < 0.01 || val > 0.5) {
+                alert('阈值范围应在 0.01% - 0.50% 之间');
+                return;
+            }
+            try {
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ near_sr_threshold_pct: val })
+                });
+                const data = await res.json();
+                if (data && data.near_sr_threshold_pct != null) {
+                    input.value = Number(data.near_sr_threshold_pct).toFixed(2);
+                }
+            } catch (error) {
+                console.error('Failed to save config:', error);
+            }
         }
 
         function initPatternsCard() {
@@ -1754,6 +1888,8 @@
             updateDailyReport();
             checkAPIStatus();
             initDailyReportCard();
+            initConfigCard();
+            loadConfig();
             
             // 每秒更新时钟
             setInterval(updateCurrentTime, 1000);
