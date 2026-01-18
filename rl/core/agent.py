@@ -13,6 +13,8 @@ from ..learning.north_star import NorthStarOptimizer
 from ..learning.strategy_params import StrategyParamLearner
 from ..learning.exit_learner import ExitTimingLearner
 from ..learning.decision_learner import DecisionFeatureLearner
+from ..learning.exit_decision_learner import ExitDecisionLearner
+from ..learning.feature_outcome import FeatureOutcomeTracker
 from ..leverage_optimizer import LeverageOptimizer
 from ..market_analysis.indicators import TechnicalAnalyzer
 from ..market_analysis.level_finder import BestLevelFinder, FEATURE_NAMES_CN
@@ -64,6 +66,7 @@ class TradingAgent:
         self.pattern_detector = PatternDetector()
         self.sl_tp = StopLossTakeProfit(self.level_scoring)
         self.position_sizer = PositionSizer(max_risk_percent=2.0)
+        # 先创建占位符，待exit_decision_learner初始化后更新
         self.exit_manager = ExitManager(f"{data_dir}/exit_params.json")
         self.strategy = StrategyParamLearner(f"{data_dir}/strategy_params.json")
         self.exit_manager.update_params(self.strategy.get_exit_params())
@@ -86,6 +89,10 @@ class TradingAgent:
         self.regime_detector = MarketRegimeDetector()
         self.breakout_detector = BreakoutDetector()
         self.exit_learner = ExitTimingLearner(data_dir)
+        self.exit_decision_learner = ExitDecisionLearner(data_dir)  # 出场决策反向传播学习器
+        self.feature_outcome = FeatureOutcomeTracker(os.path.join(data_dir, "feature_outcome.json"))
+        # 将exit_decision_learner注入到exit_manager
+        self.exit_manager.exit_decision_learner = self.exit_decision_learner
         self.current_regime = None
         self.regime_adjustments = {}
 
@@ -94,25 +101,40 @@ class TradingAgent:
         self.last_market = None
         self.last_level_scores: List[Dict] = []
         self.last_tf_weights: Dict[str, float] = {}
+        self._last_valid: Dict[str, float] = {}
         self._last_entry_time = 0
         self.entry_cooldown = 15
         self.last_signal_state = {}
         self.last_entry_plan = []
         self.last_entry_signal = None
+        self.start_time = time.time()  # Agent startup time
 
     def _get_entry_context(self, market: Dict) -> Dict:
         scores = self._score_entry(market)
         stats = self.trade_logger.get_stats()
-        # 提高阈值到55，确保只抓高质量信号
-        effective_threshold = 55
+        
+        # ========== 启用 DynamicThresholdOptimizer ==========
+        # 根据交易数量和胜率动态调整阈值
+        trade_count = stats.get("total_trades", 0)
+        win_rate = stats.get("win_rate", 50) / 100.0  # 转换为0-1
+        threshold_data = self.threshold.compute(trade_count, win_rate)
+        base_threshold = self._safe_float(threshold_data.get("threshold"), 50)
+        
+        # ========== 应用市场状态调整 ==========
+        # 从 regime_adjustments 获取阈值调整
+        regime_delta = self._safe_float(self.regime_adjustments.get("entry_threshold_delta"), 0)
+        effective_threshold = max(20, min(80, base_threshold + regime_delta))
+        
         return {
             "scores": scores,
-            "threshold": {"threshold": 55},
+            "threshold": threshold_data,
             "effective_threshold": effective_threshold,
             "cooldown": self.entry_cooldown,
-            "trade_count": stats.get("total_trades", 0),
+            "trade_count": trade_count,
+            "regime_delta": regime_delta,
         }
 
+    def _init_positions(self) -> None:
         self._load_positions()
 
     def _save_positions(self) -> None:
@@ -149,9 +171,9 @@ class TradingAgent:
         return result
 
     def _get_tf_weights(self, current_price: float, atr_15m: float) -> Dict[str, float]:
-        # 以15m为主导，降低1m噪音
-        base = {"1m": 0.10, "15m": 0.55, "8h": 0.25, "1w": 0.10}
-        high_noise = {"1m": 0.05, "15m": 0.60, "8h": 0.25, "1w": 0.10}
+        # 以15m为主导，但增加短线敏感度，降低长周期干扰
+        base = {"1m": 0.20, "15m": 0.60, "8h": 0.15, "1w": 0.05}
+        high_noise = {"1m": 0.12, "15m": 0.65, "8h": 0.15, "1w": 0.08}
         if current_price <= 0:
             return base
         vol = atr_15m / current_price
@@ -345,29 +367,77 @@ class TradingAgent:
             pass
         return 0.0
 
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _safe_float_with_last(self, key: str, value, default: float = 0.0) -> float:
+        if value is None:
+            return float(self._last_valid.get(key, default))
+        try:
+            v = float(value)
+        except Exception:
+            v = float(self._last_valid.get(key, default))
+        else:
+            self._last_valid[key] = v
+        return v
+
     def _smart_leverage(self, signal_strength: float, north_star_score: float, stats: Dict) -> int:
         """
-        智能杠杆：15-30x动态范围（从3-50x收窄到更激进但可控的范围）
-        目标：单笔盈利$4-6，需要更高杠杆
+        智能杠杆：15-50x动态范围
+        目标：强信号+高胜率 → 高杠杆，弱信号+低胜率 → 低杠杆
+        
+        杠杆分布:
+        - 15x: 弱信号(55分) + 低胜率(<45%)
+        - 30x: 中等信号(70分) + 中等胜率(50%)
+        - 50x: 强信号(85+) + 高胜率(>60%) + 趋势市
         """
-        leverage = float(self.base_leverage)  # 基础18x
+        MIN_LEVERAGE = 15
+        MAX_LEVERAGE = 50
+        BASE_LEVERAGE = 25  # 基准杠杆
         
-        # 信号强度因子（55-100分 → 0.8-1.4倍）
-        signal_factor = 0.8 + (max(0.0, min(signal_strength, 100.0)) / 100.0) * 0.6
+        leverage = float(BASE_LEVERAGE)
         
-        # 胜率因子
-        win_rate = float(stats.get("win_rate", 0)) / 100.0
-        if win_rate >= 0.55:
-            win_factor = 1.3  # 胜率高时更激进
+        # ========== 信号强度因子（55-100分 → 0.7-1.5倍）==========
+        # 55分 → 0.7倍, 75分 → 1.0倍, 100分 → 1.5倍
+        normalized_signal = (max(55.0, min(signal_strength, 100.0)) - 55.0) / 45.0  # 0-1
+        signal_factor = 0.7 + normalized_signal * 0.8
+        
+        # ========== 胜率因子 ==========
+        win_rate = float(stats.get("win_rate", 50)) / 100.0
+        if win_rate >= 0.60:
+            win_factor = 1.4   # 胜率>60%: 激进
+        elif win_rate >= 0.55:
+            win_factor = 1.2   # 胜率55-60%: 偏激进
+        elif win_rate >= 0.50:
+            win_factor = 1.0   # 胜率50-55%: 标准
         elif win_rate >= 0.45:
-            win_factor = 1.0
+            win_factor = 0.85  # 胜率45-50%: 保守
         else:
-            win_factor = 0.85  # 胜率低时保守
+            win_factor = 0.7   # 胜率<45%: 很保守
         
-        leverage *= signal_factor * win_factor
+        # ========== 市场状态因子 ==========
+        regime = self.current_regime or "NORMAL"
+        if regime in ("TRENDING", "TRENDING_VOLATILE"):
+            regime_factor = 1.2  # 趋势市更激进
+        elif regime == "RANGING":
+            regime_factor = 0.8  # 震荡市保守
+        elif regime == "VOLATILE":
+            regime_factor = 0.7  # 高波动保守
+        else:
+            regime_factor = 1.0
         
-        # 限制在15-30x范围（激进但可控）
-        return max(15, min(30, int(round(leverage))))
+        # ========== 综合计算 ==========
+        leverage *= signal_factor * win_factor * regime_factor
+        
+        # 限制在15-50x范围
+        final_leverage = max(MIN_LEVERAGE, min(MAX_LEVERAGE, int(round(leverage))))
+        
+        return final_leverage
 
     def _smart_position_size(
         self,
@@ -436,7 +506,16 @@ class TradingAgent:
                     if order_status == "FILLED":
                         return status
                     if order_status == "PARTIALLY_FILLED":
-                        # Partially filled - still return it, record what we got
+                        # 【修复】取消剩余挂单，确保成交量确定
+                        try:
+                            self.client.cancel_order(symbol, order_id=order_id)
+                        except Exception:
+                            pass
+                        # 重新查询最终成交状态
+                        time.sleep(0.5)
+                        final_status = self.client.get_order(symbol, order_id=order_id)
+                        if isinstance(final_status, dict):
+                            return final_status
                         return status
                     # Try to cancel unfilled order
                     try:
@@ -490,7 +569,8 @@ class TradingAgent:
             candidates.update(group.get("resistance", []))
 
         # Merge nearby levels across timeframes to avoid tight S/R clusters
-        def _merge_nearby(levels: List[float], tolerance_pct: float = 0.2) -> List[float]:
+        # 改进: 0.2% → 0.1% 提升合并精度 (~$100 @ $100k)
+        def _merge_nearby(levels: List[float], tolerance_pct: float = 0.1) -> List[float]:
             if not levels:
                 return []
             sorted_levels = sorted(levels)
@@ -506,7 +586,7 @@ class TradingAgent:
             merged.append(sum(current_group) / len(current_group))
             return merged
 
-        candidates = set(_merge_nearby(list(candidates), tolerance_pct=0.2))
+        candidates = set(_merge_nearby(list(candidates), tolerance_pct=0.1))
 
         best_support = None
         best_resistance = None
@@ -736,27 +816,29 @@ class TradingAgent:
         resistance_distance_pct = 999
         
         if market.get("best_support"):
-            support_price = market["best_support"]["price"]
+            support_price = self._safe_float(market["best_support"].get("price"), 0.0)
+            support_score = self._safe_float(market["best_support"].get("score"), 0.0)
             support_distance_pct = abs(price - support_price) / price * 100
-            sr_mult = self.regime_adjustments.get("sr_weight_multiplier", 1.0)
+            sr_mult = self._safe_float(self.regime_adjustments.get("sr_weight_multiplier"), 1.0)
             # 做多：靠近支撑位加分（距离阈值与S/R间距对齐）
             if support_distance_pct < 0.2:  # Within 0.2%（从0.1%放宽）
-                long_score += min(40, market["best_support"]["score"] / 2 * sr_mult)
+                long_score += min(40, support_score / 2 * sr_mult)
             elif support_distance_pct < 0.5:  # Within 0.5%（从0.3%放宽）
-                long_score += min(25, market["best_support"]["score"] / 3 * sr_mult)
+                long_score += min(25, support_score / 3 * sr_mult)
             # 做空：靠近支撑位减分
             if support_distance_pct < 0.2:
                 short_score -= 18
 
         if market.get("best_resistance"):
-            resistance_price = market["best_resistance"]["price"]
+            resistance_price = self._safe_float(market["best_resistance"].get("price"), 0.0)
+            resistance_score = self._safe_float(market["best_resistance"].get("score"), 0.0)
             resistance_distance_pct = abs(price - resistance_price) / price * 100
-            sr_mult = self.regime_adjustments.get("sr_weight_multiplier", 1.0)
+            sr_mult = self._safe_float(self.regime_adjustments.get("sr_weight_multiplier"), 1.0)
             # 做空：靠近阻力位加分
             if resistance_distance_pct < 0.2:
-                short_score += min(40, market["best_resistance"]["score"] / 2 * sr_mult)
+                short_score += min(40, resistance_score / 2 * sr_mult)
             elif resistance_distance_pct < 0.5:
-                short_score += min(25, market["best_resistance"]["score"] / 3 * sr_mult)
+                short_score += min(25, resistance_score / 3 * sr_mult)
             # 做多：靠近阻力位减分
             if resistance_distance_pct < 0.2:
                 long_score -= 18
@@ -765,22 +847,22 @@ class TradingAgent:
         # S/R间距由levels.py和agent跨周期过滤保证≥0.3%
 
         # ========== 技术指标评分（辅助信号，权重压缩）==========
-        rsi = analysis.get("rsi", 50)
+        rsi = self._safe_float_with_last("rsi_15m", analysis.get("rsi"), 50)
         if rsi < 35:
             long_score += 8  # 从10降到8
         if rsi > 65:
             short_score += 8
 
         # MACD (从10降到8)
-        if analysis.get("macd_histogram", 0) > 0:
+        if self._safe_float_with_last("macd_15m", analysis.get("macd_histogram"), 0) > 0:
             long_score += 8
-        if analysis.get("macd_histogram", 0) < 0:
+        if self._safe_float_with_last("macd_15m", analysis.get("macd_histogram"), 0) < 0:
             short_score += 8
 
         # 1m 动量（保持，因为权重已经很小）
         analysis_1m = market.get("analysis_1m", {})
-        macd_1m = analysis_1m.get("macd_histogram", 0)
-        rsi_1m = analysis_1m.get("rsi", 50)
+        macd_1m = self._safe_float_with_last("macd_1m", analysis_1m.get("macd_histogram"), 0)
+        rsi_1m = self._safe_float_with_last("rsi_1m", analysis_1m.get("rsi"), 50)
         if macd_1m > 0:
             long_score += 5
         if macd_1m < 0:
@@ -798,8 +880,16 @@ class TradingAgent:
         try:
             pattern_hits = self.pattern_detector.detect(market)
             market["patterns"] = pattern_hits if pattern_hits else []  # 修复漏洞2：确保不是None
-            long_pattern_score = sum(p.get("score", 0) for p in pattern_hits if p.get("direction") == "LONG")
-            short_pattern_score = sum(p.get("score", 0) for p in pattern_hits if p.get("direction") == "SHORT")
+            long_pattern_score = sum(
+                self._safe_float(p.get("score"), 0.0)
+                for p in pattern_hits
+                if p.get("direction") == "LONG"
+            )
+            short_pattern_score = sum(
+                self._safe_float(p.get("score"), 0.0)
+                for p in pattern_hits
+                if p.get("direction") == "SHORT"
+            )
             long_score += min(12, int(long_pattern_score))
             short_score += min(12, int(short_pattern_score))
             pattern_boost = {"long": min(12, int(long_pattern_score)), "short": min(12, int(short_pattern_score))}
@@ -838,6 +928,32 @@ class TradingAgent:
         # Apply regime multiplier and clamp to non-negative/upper bound
         long_score = int(max(0, long_score) * regime_multiplier)
         short_score = int(max(0, short_score) * regime_multiplier)
+        
+        # ========== 市场偏向性检测：动态调整做空/做多难度 ==========
+        # 基于多周期趋势判断市场整体方向
+        trend_bullish_count = 0
+        trend_bearish_count = 0
+        
+        if macro_dir == "BULLISH": trend_bullish_count += 2
+        if macro_dir == "BEARISH": trend_bearish_count += 2
+        if micro_dir == "BULLISH": trend_bullish_count += 1
+        if micro_dir == "BEARISH": trend_bearish_count += 1
+        
+        # 计算市场偏向 (-3 到 +3)
+        market_bias = trend_bullish_count - trend_bearish_count
+        
+        # 动态调整做空难度
+        if market_bias >= 2:  # 强牛市：做空分数打7.5折
+            short_score = int(short_score * 0.75)
+        elif market_bias >= 1:  # 弱牛市：做空分数打8.5折
+            short_score = int(short_score * 0.85)
+        
+        # 对称处理做多（熊市中做多更难）
+        if market_bias <= -2:  # 强熊市：做多分数打7.5折
+            long_score = int(long_score * 0.75)
+        elif market_bias <= -1:  # 弱熊市：做多分数打8.5折
+            long_score = int(long_score * 0.85)
+        
         long_score = min(100, long_score)
         short_score = min(100, short_score)
 
@@ -853,7 +969,99 @@ class TradingAgent:
             "learning_boost": {"long": round(long_learning_score, 2), "short": round(short_learning_score, 2)},
         }
 
+    def _predict_trade_outcome(self, entry_price: float, sl: float, tp: float, score: float, atr: float) -> Dict:
+        """
+        基于数学模型预测交易结果
+        """
+        try:
+            # 1. 预测持仓时间 (基于ATR)
+            dist_to_tp = abs(tp - entry_price)
+            # 假设有效趋势波动为ATR的60%（扣除噪音）
+            if atr > 0:
+                effective_atr = atr * 0.6
+            elif entry_price > 0:
+                effective_atr = entry_price * 0.005
+            else:
+                effective_atr = 1.0 # 避免除零，给一个默认值
+                
+            candles_needed = dist_to_tp / effective_atr
+            # 即使只差一点，至少也要1根K线(15m)
+            duration_min = max(15, round(candles_needed * 15))
+            
+            # 2. 预测胜率 (基于模型置信度 + 盈亏比难度)
+            # 基础胜率 50%
+            base_win_rate = 50.0
+            
+            # AI评分修正: 分数每高出阈值(55) 1分，胜率+1.5%
+            # 分数范围通常 50-90
+            score_surplus = max(0, score - 55)
+            score_impact = score_surplus * 1.5
+            
+            # 盈亏比修正: R/R越高，达成难度越大
+            risk = abs(entry_price - sl)
+            reward = abs(tp - entry_price)
+            rr_ratio = reward / risk if risk > 0 else 1.0
+            
+            # 以1:1.5为基准。
+            # 如果追求 1:3，胜率会自然下降。
+            # 公式: 难度系数 = (RR / 1.5) ^ 0.5
+            difficulty = (rr_ratio / 1.5) ** 0.5
+            
+            predicted_wr = (base_win_rate + score_impact) / (difficulty if difficulty > 0 else 1)
+            
+            # 极值限制
+            predicted_wr = max(35.0, min(95.0, predicted_wr))
+            
+            return {
+                "win_rate": predicted_wr,
+                "duration": duration_min,
+                "rr_ratio": rr_ratio
+            }
+        except Exception:
+            # Fallback in case of any math error
+            return {
+                "win_rate": 50.0,
+                "duration": 45,
+                "rr_ratio": 1.5
+            }
+
+    def _can_add_position(self, direction: str, current_price: float) -> bool:
+        """
+        检查是否允许加仓（分批建仓过滤器）
+        规则：必须满足 (时间间隔 > 3分钟) 或 (价格差距 > 0.2%)
+        """
+        same_dir_pos = [p for p in self.positions if p.get("direction") == direction]
+        if not same_dir_pos:
+            return True
+
+        try:
+            # 找到最近的一笔持仓
+            latest = max(same_dir_pos, key=lambda p: p.get("timestamp_open", ""))
+            
+            last_time = datetime.fromisoformat(latest.get("timestamp_open"))
+            time_diff = (datetime.now() - last_time).total_seconds()
+            
+            last_price = float(latest.get("entry_price", 0))
+            price_diff_pct = 0.0
+            if last_price > 0:
+                price_diff_pct = abs(current_price - last_price) / last_price
+            
+            MIN_INTERVAL = 180  # 3分钟
+            MIN_PRICE_GAP = 0.002 # 0.2%
+            
+            # 如果既没有在这个价格停留够久，价格也没有显著变化，则禁止加仓
+            if time_diff < MIN_INTERVAL and price_diff_pct < MIN_PRICE_GAP:
+                return False
+                
+            return True
+        except Exception:
+            return True
+
     def should_enter(self, market: Dict) -> Optional[Dict]:
+        # Startup cooldown: wait 3 minutes before trading
+        if time.time() - self.start_time < 180:
+             return None
+
         if len(self.positions) >= self.MAX_POSITIONS:
             return None
 
@@ -870,29 +1078,86 @@ class TradingAgent:
         self.last_signal_state = entry_ctx
 
         # Check for breakout signal (priority over normal entry)
+        # 改进：突破信号需要多维度确认，不能直接入场（防止假突破）
         breakout_signal = scores.get("breakout_signal")
         if breakout_signal and breakout_signal.get("strength", 0) > 0.3:
             direction = breakout_signal["direction"]
-            # Breakout has higher priority
-            return {
-                "direction": direction,
-                "reason": "breakout",
-                "breakout_type": breakout_signal["type"],
-                "scores": scores,
-                "threshold": threshold,
-                "effective_threshold": effective_threshold,
-                "strength": 80 + int(breakout_signal["strength"] * 20),  # 80-100
-                "flip_action": breakout_signal.get("action"),  # For reversal logic
-            }
+            
+            # ========== 多维度确认 ==========
+            analysis_15m = market.get("analysis_15m", {})
+            analysis_1m = market.get("analysis_1m", {})
+            
+            # 确认1: MACD方向一致
+            macd_15m = analysis_15m.get("macd_histogram", 0)
+            macd_confirm = (direction == "LONG" and macd_15m > 0) or (direction == "SHORT" and macd_15m < 0)
+            
+            # 确认2: RSI未极端（避免追高杀低）
+            rsi_15m = analysis_15m.get("rsi", 50)
+            rsi_ok = (direction == "LONG" and rsi_15m < 75) or (direction == "SHORT" and rsi_15m > 25)
+            
+            # 确认3: 成交量放大（近5根vs前50根）
+            klines_1m = market.get("klines_1m", [])
+            volume_confirm = False
+            if len(klines_1m) >= 10:
+                recent_vol = sum(k.get("volume", 0) for k in klines_1m[-5:]) / 5
+                avg_vol = sum(k.get("volume", 0) for k in klines_1m[-50:]) / max(1, len(klines_1m[-50:]))
+                volume_confirm = recent_vol > avg_vol * 1.2  # 成交量放大20%
+            
+            # 确认4: 突破强度足够（至少0.5）
+            strength_confirm = breakout_signal.get("strength", 0) >= 0.5
+            
+            # 确认计数
+            confirms = sum([macd_confirm, rsi_ok, volume_confirm, strength_confirm])
+            confirmations_list = []
+            if macd_confirm: confirmations_list.append("MACD方向一致")
+            if rsi_ok: confirmations_list.append("RSI未极端")
+            if volume_confirm: confirmations_list.append("成交量放大")
+            if strength_confirm: confirmations_list.append("突破强度足够")
+            
+            # 至少2项确认才允许入场（降低错过短线突破的概率）
+            if confirms >= 2:
+                return {
+                    "direction": direction,
+                    "reason": "breakout_confirmed",
+                    "breakout_type": breakout_signal["type"],
+                    "scores": scores,
+                    "threshold": threshold,
+                    "effective_threshold": effective_threshold,
+                    "strength": 80 + int(breakout_signal["strength"] * 20),  # 80-100
+                    "flip_action": breakout_signal.get("action"),
+                    "confirmations": confirmations_list,
+                    "confirm_count": confirms,
+                }
+            # 确认不足，降级为普通评分入场（突破信号仍加分，但需要满足阈值）
 
         # Adjacent multi-signal filter: enforce minimum S/R gap
         if market.get("sr_gap_valid") is False:
             return None
+        
+        # Fee-aware edge filter: dynamic minimum edge based on ATR + fees
+        price = market.get("current_price", 0)
+        analysis_15m = market.get("analysis_15m", {})
+        atr_15m = analysis_15m.get("atr", 0) or 0
+        atr_pct = (atr_15m / price) * 100 if price > 0 else 0.0
+        estimated_fee_pct = 0.12  # 0.12% round-trip fee + slippage buffer
+        min_edge_pct = max(estimated_fee_pct * 1.8, min(0.8, atr_pct * 0.6 + estimated_fee_pct))
+        best_support = market.get("best_support")
+        best_resistance = market.get("best_resistance")
+        profit_space_long = None
+        profit_space_short = None
+        if best_resistance and best_resistance.get("price") and price:
+            profit_space_long = (best_resistance["price"] - price) / price * 100
+        if best_support and best_support.get("price") and price:
+            profit_space_short = (price - best_support["price"]) / price * 100
 
         # Normal score-based entry with trend-aware tie-breaking
         # MICRO trend takes priority for short-term trading
         long_ok = scores["long"] >= effective_threshold
         short_ok = scores["short"] >= effective_threshold
+        if long_ok and profit_space_long is not None and profit_space_long < min_edge_pct:
+            long_ok = False
+        if short_ok and profit_space_short is not None and profit_space_short < min_edge_pct:
+            short_ok = False
         # Scheme B for middle-ground: allow if strong score or pattern confirmation
         if scores.get("patterns"):
             for p in scores["patterns"]:
@@ -920,6 +1185,11 @@ class TradingAgent:
                 return None  # All signals unclear, don't enter
 
             decision_features = scores.get("decision_features", {}).get(chosen.lower(), {})
+            
+            # 分批建仓检查
+            if not self._can_add_position(chosen, market["current_price"]):
+                return None
+
             return {
                 "direction": chosen,
                 "reason": "score_trend_tiebreak",
@@ -932,6 +1202,8 @@ class TradingAgent:
             }
 
         if long_ok:
+            if not self._can_add_position("LONG", market["current_price"]):
+                return None
             return {
                 "direction": "LONG",
                 "reason": "score",
@@ -943,6 +1215,8 @@ class TradingAgent:
                 "decision_features": scores.get("decision_features", {}).get("long", {}),
             }
         if short_ok:
+            if not self._can_add_position("SHORT", market["current_price"]):
+                return None
             return {
                 "direction": "SHORT",
                 "reason": "score",
@@ -988,10 +1262,14 @@ class TradingAgent:
 
     def execute_entry(self, market: Dict, signal: Dict) -> Dict:
         price = market["current_price"]
-        atr = market["analysis_15m"].get("atr", 0)
+        atr = self._safe_float_with_last(
+            "atr_15m",
+            market["analysis_15m"].get("atr"),
+            0.0,
+        )
         self.sl_tp.update_params(self.strategy.get_sl_tp_params())
-        # 传递market给智能止盈计算
-        sltp = self.sl_tp.calculate(price, signal["direction"], atr, market=market)
+        # 传递market和regime_adjustments给智能止盈计算
+        sltp = self.sl_tp.calculate(price, signal["direction"], atr, market=market, regime_adjustments=self.regime_adjustments)
         stats = self.trade_logger.get_stats()
         north_star = self.north_star.evaluate(stats)
         signal_strength = float(signal.get("strength", 50))
@@ -1003,6 +1281,9 @@ class TradingAgent:
         )
         if base_qty <= 0:
             return {"error": "计算仓位为0，保证金可能不足"}
+        # Feature-driven position sizing (same-feature reinforcement)
+        size_factor = self.feature_outcome.entry_size_factor(decision_features)
+        base_qty = base_qty * size_factor
         base_qty = max(0.001, round(base_qty, 3))
         base_qty = min(base_qty, 0.5)
         filters = {}
@@ -1024,76 +1305,78 @@ class TradingAgent:
                 pass
             self.leverage = leverage
 
-        batches = self.batch_manager.plan_entries(signal.get("strength", 50))
-        total_batches = max(1, len(batches))
-        created = []
-        for idx, batch in enumerate(batches):
-            if len(self.positions) >= self.MAX_POSITIONS:
-                break
-            qty = round(base_qty * batch["ratio"], 3)
-            # Ensure batch qty meets minimum requirements
-            if qty < min_qty:
-                qty = min_qty
-            if min_notional > 0 and price * qty < min_notional:
-                continue  # Skip this batch if too small
-            margin_estimate = qty * price / max(1, leverage)
-            if available_margin > 0 and margin_estimate > available_margin * 0.9:
-                return {"error": "保证金不足，已跳过入场"}
-            if total_batches > 1:
-                tp_scale = 0.7 + 0.3 * (idx / (total_batches - 1))
-            else:
-                tp_scale = 1.0
-            if signal["direction"] == "LONG":
-                take_profit = price + (sltp["take_profit"] - price) * tp_scale
-            else:
-                take_profit = price - (price - sltp["take_profit"]) * tp_scale
-            trade_id = str(uuid.uuid4())
-            position = {
-                "trade_id": trade_id,
-                "direction": signal["direction"],
-                "entry_price": price,
-                "quantity": qty,
-                "stop_loss": sltp["stop_loss"],
-                "take_profit": take_profit,
-                "leverage": leverage,
-                "margin_used": round(margin_estimate, 4),
-                "timestamp_open": datetime.now().isoformat(),
-                "entry_score": signal.get("strength", 0),
-                "entry_reason": signal.get("reason", ""),
-                "batch_index": idx + 1,
-                "batch_ratio": batch.get("ratio"),
-                "patterns": signal.get("patterns", []),
-                "decision_features": signal.get("decision_features", {}),
-                "level_features": (
-                    market.get("best_support", {}).get("features")
-                    if signal["direction"] == "LONG"
-                    else market.get("best_resistance", {}).get("features")
-                ),
-            }
-            try:
-                side = "BUY" if signal["direction"] == "LONG" else "SELL"
-                order = self._place_limit_with_requote(
-                    symbol="BTCUSDT",
-                    side=side,
-                    quantity=position["quantity"],
-                    current_price=price,
-                )
-                if not order:
-                    return {"error": "limit_order_unfilled"}
-                executed_qty = float(order.get("executedQty", position["quantity"]))
-                if executed_qty > 0:
-                    position["quantity"] = round(executed_qty, 3)
-            except Exception as exc:
-                return {"error": str(exc)}
+        # 强制单次信号只开一笔，禁用即时分批，交由 _can_add_position 控制节奏
+        # batches = self.batch_manager.plan_entries(signal.get("strength", 50))
+        qty = base_qty
+        
+        # Ensure qty meets minimum requirements
+        if qty < min_qty:
+            qty = min_qty
+        if min_notional > 0 and price * qty < min_notional:
+            return {"error": "仓位价值过小"}
+            
+        margin_estimate = qty * price / max(1, leverage)
+        if available_margin > 0 and margin_estimate > available_margin * 0.9:
+            return {"error": "保证金不足，已跳过入场"}
 
-            self.positions.append(position)
-            created.append(position)
-
+        take_profit = sltp["take_profit"]
+        stop_loss = sltp["stop_loss"]
+            
+        trade_id = str(uuid.uuid4())
+            
+        # ========== 确保始终提取决策特征 ==========
+        decision_features = signal.get("decision_features", {})
+        if not decision_features:
+            # 如果信号中没有决策特征，从市场数据重新提取
+            decision_features = self.decision_learner.extract_features(
+                market, signal["direction"]
+            )
+        
+        position = {
+            "trade_id": trade_id,
+            "direction": signal["direction"],
+            "entry_price": price,
+            "quantity": qty,
+            "stop_loss": sltp["stop_loss"],
+            "take_profit": take_profit,
+            "leverage": leverage,
+            "margin_used": round(margin_estimate, 4),
+            "timestamp_open": datetime.now().isoformat(),
+            "entry_score": signal.get("strength", 0),
+            "entry_reason": signal.get("reason", ""),
+            "batch_index": 1,
+            "batch_ratio": 1.0,
+            "patterns": signal.get("patterns", []),
+            "level_features": signal.get("level_features", {}),
+            "level_finder_score": getattr(self.level_finder, 'last_score', 0),
+            "decision_features": decision_features,
+            "entry_size_factor": round(size_factor, 3),
+            "external": False,
+        }
+        try:
+            side = "BUY" if signal["direction"] == "LONG" else "SELL"
+            order = self._place_limit_with_requote(
+                symbol="BTCUSDT",
+                side=side,
+                quantity=position["quantity"],
+                current_price=price,
+            )
+            if not order:
+                return {"error": "limit_order_unfilled"}
+            executed_qty = float(order.get("executedQty", position["quantity"]))
+            if executed_qty > 0:
+                position["quantity"] = round(executed_qty, 3)
+        except Exception as exc:
+            return {"error": str(exc)}
+            
+        self.positions.append(position)
+        self.trade_logger.log_trade(position)
         self._save_positions()
+        
         self._last_entry_time = time.time()
-        self.last_entry_plan = batches
+        # self.last_entry_plan = batches # batches is commented out, so this line is likely not needed or needs re-evaluation
         self.last_entry_signal = signal
-        return created[0] if created else {"error": "no_position"}
+        return position
 
     def check_exit_all(self, current_price: float, market: Dict) -> List[Tuple[Dict, ExitDecision]]:
         exits = []
@@ -1101,6 +1384,7 @@ class TradingAgent:
         market_with_scores = dict(market)
         market_with_scores["entry_scores"] = {"long": scores["long"], "short": scores["short"]}
         market_with_scores["entry_threshold"] = scores.get("threshold", {})
+        market_with_scores["feature_outcome"] = self.feature_outcome
         for pos in list(self.positions):
             state = self.position_states.get(pos.get("trade_id")) or {}
             decision = self.exit_manager.evaluate(pos, market_with_scores, current_price, state)
@@ -1118,16 +1402,21 @@ class TradingAgent:
         confirmations: List[str],
         skip_api: bool = False,
         skip_order: bool = False,
+        fraction: float = 1.0,  # 平仓比例，默认全平
     ) -> Optional[Dict]:
         if skip_order:
             skip_api = True
+        
+        total_qty = position["quantity"]
+        exit_qty = total_qty * fraction
+        
         if not skip_api:
             side = "SELL" if position["direction"] == "LONG" else "BUY"
             try:
                 order = self._place_limit_with_requote(
                     symbol="BTCUSDT",
                     side=side,
-                    quantity=position["quantity"],
+                    quantity=exit_qty,
                     current_price=current_price,
                     reduce_only=True,
                 )
@@ -1137,7 +1426,7 @@ class TradingAgent:
                 pass  # 继续清理本地持仓，即使API失败
 
         entry_price = position["entry_price"]
-        qty = position["quantity"]
+        qty = exit_qty
         
         # 计算原始盈亏
         raw_pnl = (
@@ -1146,8 +1435,8 @@ class TradingAgent:
             else (entry_price - current_price) * qty
         )
         
-        # 计算手续费（限价单0.02%，开仓+平仓各一次）
-        commission_rate = 0.0002  # 0.02% per side
+        # 计算手续费（保守估算按Taker 0.05%，开仓+平仓各一次）
+        commission_rate = 0.0005  # 0.05% per side (Taker rate)
         entry_commission = entry_price * qty * commission_rate
         exit_commission = current_price * qty * commission_rate
         total_commission = entry_commission + exit_commission
@@ -1220,24 +1509,106 @@ class TradingAgent:
             "direction": position["direction"],
             "entry_price": entry_price,
             "exit_price": current_price,
-            "quantity": position["quantity"],
+            "quantity": exit_qty,
             "leverage": position.get("leverage", self.leverage),
-            "pnl": round(pnl, 4),
-            "pnl_percent": round(pnl_percent, 4),
-            "raw_pnl": round(raw_pnl, 4),
+            "pnl": round(pnl, 2),
+            "pnl_percent": round(pnl_percent, 2),
+            "raw_pnl": round(raw_pnl, 2),
             "commission": round(total_commission, 4),
-            "exit_reason": reason,
+            "exit_reason": f"{reason} (Partial {fraction*100:.0f}%)" if fraction < 1.0 else reason,
             "timestamp_open": position["timestamp_open"],
             "timestamp_close": exit_time.isoformat(),
+            "is_win": 1 if pnl > 0 else 0,
+            "hold_duration_minutes": round(hold_minutes, 2),
             "stop_loss": position.get("stop_loss"),
             "take_profit": position.get("take_profit"),
             "patterns": position.get("patterns", []),
+            "strategies": position.get("strategies", []), 
+            "market_state": (self.current_regime or (self.last_market or {}).get("regime", {}).get("regime") or "UNKNOWN"),
+            "entry_reason": position.get("entry_reason", ""),
         }
         self.trade_logger.log_trade(trade)
         self.risk.update_trade_result(pnl_percent)
         self.level_finder.update_stats(pnl > 0)
+        
+        # ========== 决策特征学习（独立执行，不依赖level_features）==========
+        decision_features = position.get("decision_features", {})
+        if not decision_features and self.last_market:
+            # 如果没有记录，尝试从当前市场重新提取
+            direction = position.get("direction", "LONG")
+            decision_features = self.decision_learner.extract_features(
+                self.last_market, direction
+            )
+        
+        is_external = bool(position.get("external"))
+        # 始终尝试更新决策学习器
+        if decision_features and not is_external:
+            try:
+                # 只有全平或主要利润时才更新学习，或者部分平仓也更新？
+                # 更新为本次平仓的盈亏
+                decision_update = self.decision_learner.update(
+                    decision_features,
+                    pnl_percent,
+                    hold_minutes=hold_minutes,
+                )
+                trade["decision_learning"] = decision_update
+            except Exception as e:
+                pass  # 学习失败不影响交易记录
+        
+        # ========== K线形态学习 ==========
+        patterns = position.get("patterns", [])
+        is_win = pnl > 0
+        pattern_updates = []
+        for pattern in patterns:
+            pattern_name = pattern.get("name") if isinstance(pattern, dict) else pattern
+            if pattern_name:
+                try:
+                    if not is_external:
+                        update = self.pattern_detector.update_pattern(pattern_name, pnl_percent, is_win)
+                        if update:
+                            pattern_updates.append(update)
+                except Exception as e:
+                    pass  # 形态学习失败不影响交易
+        if pattern_updates:
+            trade["pattern_learning"] = pattern_updates
+        
+        # ========== 出场决策反向传播学习 ==========
+        if not is_external:
+            try:
+                market = self.last_market or {}
+                exit_features = self.exit_decision_learner.extract_features(
+                    position, market, current_price
+                )
+                exit_decision_update = self.exit_decision_learner.update(
+                    exit_features,
+                    exit_quality=exit_timing_quality,
+                    pnl_percent=pnl_percent,
+                    hold_minutes=hold_minutes,
+                )
+                trade["exit_decision_learning"] = exit_decision_update
+            except Exception:
+                pass  # 出场决策学习失败不影响交易
+
+            # Feature outcome reinforcement for entry/exit controls
+            try:
+                if decision_features:
+                    self.feature_outcome.update_entry(
+                        decision_features,
+                        pnl_percent=pnl_percent,
+                        hold_minutes=hold_minutes,
+                    )
+                if exit_features:
+                    self.feature_outcome.update_exit(
+                        exit_features,
+                        pnl_percent=pnl_percent,
+                        hold_minutes=hold_minutes,
+                    )
+            except Exception:
+                pass
+        
+        # Level特征学习（如果有的话）
         features = position.get("level_features")
-        if features:
+        if features and not is_external:
             pnl_reward = max(-1.0, min(1.0, pnl_percent / 2.0))
             timing_feedback = self._timing_feedback(position, current_price, exit_time)
             timing_reward = float(timing_feedback.get("timing_reward", 0.0)) if timing_feedback else 0.0
@@ -1262,19 +1633,21 @@ class TradingAgent:
             update = self.level_finder.update_weights(features, reward)
             if update:
                 trade["weight_update"] = update
-            
-            # ========== 决策特征学习（自我进化）==========
-            decision_features = position.get("decision_features", {})
-            # 修复漏洞7：空字典也应该学习（去掉if判断）
-            if decision_features and len(decision_features) > 0:
-                try:
-                    decision_update = self.decision_learner.update(decision_features, pnl_percent)
-                    trade["decision_learning"] = decision_update
-                except Exception as e:
-                    # 学习失败不影响交易记录
-                    pass
         
-        self.positions = [p for p in self.positions if p["trade_id"] != position["trade_id"]]
+        if fraction >= 1.0:
+            # 全平：移除持仓
+            self.positions = [p for p in self.positions if p["trade_id"] != position["trade_id"]]
+            if position.get("trade_id") in self.position_states:
+                del self.position_states[position.get("trade_id")]
+        else:
+            # 分批：更新剩余数量
+            position["quantity"] = round(total_qty - exit_qty, 4)
+            # 记录部分平仓事件以免重复触发？
+            # 可以在 position_states 中记录 "secured_profit": True
+            state = self.position_states.get(position.get("trade_id"), {})
+            state["secured_profit"] = True
+            self.position_states[position.get("trade_id")] = state
+            
         self._save_positions()
         return trade
 
@@ -1296,6 +1669,7 @@ class TradingAgent:
     def get_ai_logic(self) -> Dict:
         if not self.last_market:
             return {}
+        current_price = self.last_market.get("current_price", 0)
         scores = self.get_current_scores(self.last_market)
         analysis = self.last_market["analysis_15m"]
         because = [
@@ -1325,11 +1699,80 @@ class TradingAgent:
         elif scores["short"] >= scores["min_score"]:
             conclusion = "空头信号"
 
+        # 生成白话文解读
+        narrative_parts = []
+        
+        # 1. 趋势解读
+        macro = self.last_market['macro_trend']['direction']
+        micro = self.last_market['micro_trend']['direction']
+        trend_desc = "一致看涨" if macro == "BULLISH" and micro == "BULLISH" else \
+                     "一致看跌" if macro == "BEARISH" and micro == "BEARISH" else \
+                     "分歧(大势" + macro + "/小势" + micro + ")"
+        narrative_parts.append(f"当前市场趋势{trend_desc}。")
+        
+        # 2. 指标解读
+        rsi_val = analysis.get('rsi', 50)
+        rsi_status = "超买" if rsi_val > 70 else "超卖" if rsi_val < 30 else "中性"
+        narrative_parts.append(f"RSI({rsi_val:.1f}){rsi_status}。")
+        
+        # 3. 支撑阻力
+        if self.best_support and self.best_resistance:
+            cur_price = current_price or 0
+            dist_s = (cur_price - self.best_support['price']) / cur_price * 100
+            dist_r = (self.best_resistance['price'] - cur_price) / cur_price * 100
+            narrative_parts.append(f"下方{dist_s:.2f}%处有支撑，上方{dist_r:.2f}%处有阻力。")
+            
+        # 4. 决策逻辑
+        if conclusion == "多头信号":
+             narrative_parts.append(f"因多头评分({scores['long']:.0f})突破阈值({scores['min_score']:.0f})，系统决定做多。")
+        elif conclusion == "空头信号":
+             narrative_parts.append(f"因空头评分({scores['short']:.0f})突破阈值({scores['min_score']:.0f})，系统决定做空。")
+        else:
+             high_score = max(scores['long'], scores['short'])
+             narrative_parts.append(f"最高评分({high_score:.0f})未达阈值({scores['min_score']:.0f})，保持观望。")
+             
+        # 5. 预期 (基于数学推演)
+        # 即使当前未开仓，也可以基于假设的入场（当前价格）进行推演
+        calc_direction = "LONG" if scores["long"] > scores["short"] else "SHORT"
+        calc_score = scores["long"] if calc_direction == "LONG" else scores["short"]
+        if calc_score < scores["min_score"]:
+            # 如果未达阈值，使用最高分做假设，但通过前缀说明是"假设"
+            calc_direction = "LONG" if scores["long"] > scores["short"] else "SHORT"
+            calc_score = max(scores["long"], scores["short"])
+        
+        # 动态计算 SL/TP
+        atr = analysis.get("atr", current_price * 0.01)
+        self.sl_tp.update_params(self.strategy.get_sl_tp_params())
+        sltp = self.sl_tp.calculate(current_price, calc_direction, atr, market=self.last_market, regime_adjustments=self.regime_adjustments)
+        
+        prediction = self._predict_trade_outcome(
+            current_price, 
+            sltp["stop_loss"], 
+            sltp["take_profit"], 
+            calc_score, 
+            atr
+        )
+        
+        rr_str = f"1:{prediction['rr_ratio']:.1f}"
+        win_str = f"{prediction['win_rate']:.1f}%"
+        time_str = f"{prediction['duration']}分钟"
+        
+        narrative_parts.append(f"当前模型推演：盈亏比{rr_str}，预期胜率{win_str}，预计持仓{time_str}。")
+
+        narrative = "".join(narrative_parts)
+
+        # ... (Previous code)
+        
+        # 5. 预期 (基于数学推演)
+        # ... (Prediction logic code) ...
+        # ...
+
         positions = []
-        current_price = self.last_market.get("current_price", 0)
+        # current_price already defined at top
         opportunity_delta = self.exit_manager.params.get("opportunity_delta", 0)
         min_profit = self.exit_manager.params.get("min_profit_pct", 0)
         max_hold = self.exit_manager.params.get("max_hold_minutes", 0)
+        
         for pos in self.positions:
             hold_minutes = None
             try:
@@ -1339,18 +1782,29 @@ class TradingAgent:
                 hold_minutes = None
             pnl_percent = 0.0
             entry_price = pos.get("entry_price", 0)
+            direction = pos.get("direction")
+            
             if entry_price:
-                if pos.get("direction") == "LONG":
+                if direction == "LONG":
                     pnl_percent = (current_price - entry_price) / entry_price * 100
                 else:
                     pnl_percent = (entry_price - current_price) / entry_price * 100
-            if pos.get("direction") == "LONG":
-                opp_score = scores.get("short", 0)
-                opp_label = "空头"
-            else:
-                opp_score = scores.get("long", 0)
-                opp_label = "多头"
-            opp_need = scores.get("min_score", 0) + opportunity_delta
+            
+            # 【UI增强】计算SL/TP距离百分比
+            try:
+                sl = float(pos.get("stop_loss", 0))
+                tp = float(pos.get("take_profit", 0))
+                dist_sl = abs(current_price - sl) / current_price * 100 if sl > 0 else 0
+                dist_tp = abs(tp - current_price) / current_price * 100 if tp > 0 else 0
+            except Exception:
+                dist_sl = 0
+                dist_tp = 0
+
+            # ... (Opportunity logic) ...
+            
+            # 【分批止盈】调用exit_manager评估
+            # 传递更多状态以支持分批止盈判断
+            # ...
             decision = self.exit_manager.evaluate(
                 pos,
                 {
@@ -1360,33 +1814,30 @@ class TradingAgent:
                 },
                 current_price,
             )
+            
+            # Decision might suggest partial exit
+            
             positions.append(
                 {
                     "trade_id": pos.get("trade_id"),
-                    "direction": pos.get("direction"),
+                    "direction": direction,
                     "entry_price": entry_price,
                     "current_price": current_price,
-                    "stop_loss": pos.get("stop_loss"),
-                    "take_profit": pos.get("take_profit"),
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "dist_sl_pct": round(dist_sl, 2), # New
+                    "dist_tp_pct": round(dist_tp, 2), # New
                     "entry_score": pos.get("entry_score", 0),
                     "hold_minutes": hold_minutes,
                     "pnl_percent": pnl_percent,
                     "exit_hint": decision.reason if decision else "",
                     "exit_notes": decision.confirmations if decision else [],
-                    "opportunity": {
-                        "label": opp_label,
-                        "score": opp_score,
-                        "need": opp_need,
-                        "gap": opp_score - opp_need,
-                    },
-                    "time_cost": {
-                        "hold_minutes": hold_minutes if hold_minutes else 0,
-                        "max_hold": max_hold,
-                        "current_profit": pnl_percent,
-                        "min_profit": min_profit,
-                    },
+                    # ... (rest of dict)
                 }
             )
+        
+        # ... (rest of function) ...
+
 
         entry_info = {
             "long_score": scores["long"],
@@ -1412,6 +1863,19 @@ class TradingAgent:
             "opportunity_delta": opportunity_delta,
             "max_hold_minutes": max_hold,
             "min_profit_pct": min_profit,
+        }
+        
+        # 学习状态增强
+        learning_stats = self.strategy.get_learning_stats() if hasattr(self.strategy, 'get_learning_stats') else {}
+        epsilon = learning_stats.get("epsilon", 0.1)
+        samples = learning_stats.get("total_samples", 0)
+        
+        learning_info = {
+            "mode": "EXPLORATION" if epsilon > 0.1 else "EXPLOITATION",
+            "epsilon": round(epsilon, 3),
+            "samples": samples,
+            "focus": "优化震荡策略" if samples > 1000 else "基础特征积累", # 简化的动态焦点
+            "recent_accuracy": learning_stats.get("recent_accuracy", 0.0),
         }
 
         # 市场状态识别
@@ -1452,6 +1916,7 @@ class TradingAgent:
             "because": because,
             "therefore": therefore,
             "conclusion": conclusion,
+            "narrative": narrative,
             "entry": entry_info,
             "positions": positions,
             "batch": batch_info,

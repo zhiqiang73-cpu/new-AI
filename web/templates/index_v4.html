@@ -147,6 +147,17 @@
             display: none;
         }
 
+        /* 折叠时压缩卡片上下空间 */
+        .card.collapsed {
+            min-height: 0 !important;
+            height: auto;
+            flex: 0 0 auto;
+        }
+
+        .card.collapsed .card-header {
+            padding: 6px 10px;
+        }
+
         .weight-delta {
             width: 70px;
             text-align: right;
@@ -447,6 +458,17 @@
                 <div class="card-header" style="position: sticky; top: 0; z-index: 10; background: #1e2329;">AI 决策逻辑</div>
                 <div class="card-body" id="ai-logic" style="overflow-y: auto; overflow-x: hidden;">
                     <div class="no-data">等待分析...</div>
+                </div>
+            </div>
+
+            <!-- 当日总结 -->
+            <div class="card collapsed" id="daily-report-card" style="min-height: 220px;">
+                <div class="card-header clickable" onclick="toggleDailyReportCard()">
+                    当日总结（手续费/净收益/教训）
+                    <span class="collapse-indicator" id="daily-report-toggle-text">点击展开</span>
+                </div>
+                <div class="card-body" id="daily-report-container">
+                    <div class="no-data">暂无当日数据</div>
                 </div>
             </div>
             
@@ -756,6 +778,39 @@
             if (!card || !text) return;
             card.classList.add('collapsed');
             text.textContent = '点击展开';
+        }
+
+        // 当日总结卡片折叠控制
+        function toggleDailyReportCard() {
+            const card = document.getElementById('daily-report-card');
+            const text = document.getElementById('daily-report-toggle-text');
+            if (!card || !text) return;
+            const collapsed = card.classList.toggle('collapsed');
+            text.textContent = collapsed ? '点击展开' : '点击收起';
+            try {
+                localStorage.setItem('dailyReportCardCollapsed', collapsed ? '1' : '0');
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        function initDailyReportCard() {
+            const card = document.getElementById('daily-report-card');
+            const text = document.getElementById('daily-report-toggle-text');
+            if (!card || !text) return;
+            let collapsed = true;
+            try {
+                collapsed = localStorage.getItem('dailyReportCardCollapsed') !== '0';
+            } catch (error) {
+                collapsed = true;
+            }
+            if (collapsed) {
+                card.classList.add('collapsed');
+                text.textContent = '点击展开';
+            } else {
+                card.classList.remove('collapsed');
+                text.textContent = '点击收起';
+            }
         }
 
         // 渲染特征权重
@@ -1100,6 +1155,17 @@
                     });
                     html += '</div>';
                 };
+
+                // 简明解释（面向小白的自然语言）
+                const narrativeText = (ai.narrative || '').trim();
+                let simpleLines = [];
+                if (narrativeText) {
+                    const parts = narrativeText.split('。').map(p => p.trim()).filter(Boolean);
+                    simpleLines = parts.slice(0, 3).map(p => `${p}。`);
+                } else {
+                    simpleLines = ['当前信息不足，系统选择观望。'];
+                }
+                addSection('简明解释', simpleLines);
 
                 // 核心判断（最多3段）
                 let regimeLine = '';
@@ -1621,6 +1687,55 @@
                 console.error('Failed to update learning:', error);
             }
         }
+
+        // 当日总结（手续费吞噬率 / 净收益 / 亏损教训）
+        async function updateDailyReport() {
+            try {
+                const response = await fetch('/api/daily_report');
+                const data = await response.json();
+                const container = document.getElementById('daily-report-container');
+                if (!container) return;
+
+                if (!data || !data.has_data) {
+                    container.innerHTML = '<div class="no-data">暂无当日数据</div>';
+                    return;
+                }
+
+                const s = data.summary || {};
+                const netColor = (Number(s.net_pnl || 0) >= 0) ? '#02c076' : '#f6465d';
+                const feeColor = (Number(s.total_commission || 0) > 0 && Number(s.net_pnl || 0) <= Number(s.total_commission || 0))
+                    ? '#f0b90b' : '#848e9c';
+                const feeRatio = Number(s.fee_ratio || 0) * 100;
+                const netGtFee = s.net_gt_fee ? '✅' : '⚠️';
+
+                let html = '';
+                html += `<div style="margin-bottom:6px; color:#f0b90b;">📅 当日: ${s.date || '-'} | 成交 ${s.total_trades || 0} 笔 | 胜率 ${Number(s.win_rate || 0).toFixed(1)}%</div>`;
+                html += `<div style="font-size:12px; color:${netColor};">净收益: $${Number(s.net_pnl || 0).toFixed(2)} (${netGtFee} 净收益 > 手续费)</div>`;
+                html += `<div style="font-size:12px; color:#848e9c;">毛收益: $${Number(s.gross_pnl || 0).toFixed(2)} | 手续费: $${Number(s.total_commission || 0).toFixed(4)} <span style="color:${feeColor};">吞噬率 ${feeRatio.toFixed(1)}%</span></div>`;
+                html += `<div style="font-size:12px; color:#848e9c;">单笔均值: $${Number(s.avg_pnl || 0).toFixed(2)} | 平均盈利: $${Number(s.avg_win || 0).toFixed(2)} | 平均亏损: $${Number(s.avg_loss || 0).toFixed(2)}</div>`;
+
+                const lessons = data.loss_lessons || [];
+                if (lessons.length) {
+                    html += '<div style="margin-top:8px; color:#f0b90b; font-size:11px;">🧾 亏损交易教训清单</div>';
+                    lessons.forEach(section => {
+                        const titleMap = {
+                            'exit_reason': '主要亏损出场原因',
+                            'market_state': '易亏市场状态',
+                            'pattern': '高风险形态',
+                        };
+                        const title = titleMap[section.type] || section.type;
+                        html += `<div style="margin-top:6px; color:#848e9c; font-size:11px;">${title}：</div>`;
+                        (section.items || []).forEach(item => {
+                            html += `<div style="font-size:11px; color:#eaecef;">- ${item.name} | ${item.count}次 | 平均亏损 $${Number(item.avg_pnl || 0).toFixed(2)}</div>`;
+                        });
+                    });
+                }
+
+                container.innerHTML = html;
+            } catch (error) {
+                console.error('Failed to update daily report:', error);
+            }
+        }
         
         // 主更新循环
         function startUpdateLoop() {
@@ -1636,7 +1751,9 @@
             updateTrades();
             updatePatterns();
             updateLearning();
+            updateDailyReport();
             checkAPIStatus();
+            initDailyReportCard();
             
             // 每秒更新时钟
             setInterval(updateCurrentTime, 1000);
@@ -1662,6 +1779,7 @@
                 updateTrades();
                 updatePatterns();
                 updateLearning();
+                updateDailyReport();
             }, 3000);
             
             // 5秒检查API状态

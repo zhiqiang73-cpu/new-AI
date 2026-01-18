@@ -47,7 +47,10 @@ class LevelFeatureCalculator:
                 continue
             touched = any(self._near(k["close"], level) for k in klines)
             if touched:
-                score += tf_weights.get(tf, 0)
+                w = tf_weights.get(tf, 0)
+                if w is None:
+                    w = 0
+                score += w
         return min(score / total_w, 1.0)
 
     def calculate(self, level: float, klines: List[Dict]) -> Dict:
@@ -58,7 +61,10 @@ class LevelFeatureCalculator:
         failed_breakouts = 0
         first_ts = None
         last_ts = None
-        max_volume = max([k.get("volume", 0) for k in klines], default=1)
+        max_volume = max(
+            [(k.get("volume", 0) or 0) for k in klines],
+            default=1,
+        )
 
         for i in range(1, len(klines)):
             k = klines[i]
@@ -66,7 +72,7 @@ class LevelFeatureCalculator:
             price = k["close"]
             if self._near(price, level):
                 touches += 1
-                volumes.append(k.get("volume", 0))
+                volumes.append(k.get("volume", 0) or 0)
                 if first_ts is None:
                     first_ts = k.get("time")
                 last_ts = k.get("time")
@@ -181,6 +187,15 @@ class BestLevelFinder:
         self._save()
 
     def update_weights(self, features: Dict, reward: float, min_trades: int = 20) -> None:
+        """
+        增强版强化学习权重更新
+        
+        改进点:
+        1. 自适应学习率（早期快速学习，后期稳定）
+        2. 梯度动量（防止震荡）
+        3. 特征重要性追踪（统计每个特征与盈亏的相关性）
+        4. 反向传播：盈利增强特征，亏损削弱特征
+        """
         total = self.stats.get("total_trades", 0)
         if total < min_trades:
             return
@@ -188,32 +203,75 @@ class BestLevelFinder:
         before = self.stats.get("weights", DEFAULT_WEIGHTS).copy()
         weights = before.copy()
         
-        # Adaptive learning rate: higher for early trades (20-50), then stabilize
-        base_lr = self.stats.get("learning_rate", 0.12)
-        if total <= 50:
-            # Early phase: boost learning rate (2x for first 20, then 1.5x for 21-50)
-            lr_multiplier = 2.0 if total <= 20 else 1.5
+        # ========== 自适应学习率 ==========
+        base_lr = 0.15
+        if total <= 30:
+            lr = base_lr * 2.0  # 早期快速学习
+        elif total <= 100:
+            lr = base_lr * 1.5  # 中期加速
+        elif total <= 500:
+            lr = base_lr * 1.0  # 稳定期
         else:
-            # Stable phase: normal learning rate
-            lr_multiplier = 1.0
+            lr = base_lr * 0.8  # 成熟期，细微调整
         
-        lr = base_lr * lr_multiplier
+        # ========== 特征重要性追踪 ==========
+        feature_stats = self.stats.get("feature_stats", {})
+        for k, v in features.items():
+            if k not in feature_stats:
+                feature_stats[k] = {"sum_reward": 0.0, "count": 0, "correlation": 0.0}
+            feature_stats[k]["sum_reward"] += v * reward
+            feature_stats[k]["count"] += 1
+            # 计算相关性（正相关=有效特征，负相关=无效特征）
+            if feature_stats[k]["count"] > 0:
+                feature_stats[k]["correlation"] = feature_stats[k]["sum_reward"] / feature_stats[k]["count"]
+        self.stats["feature_stats"] = feature_stats
         
+        # ========== 梯度动量 ==========
+        momentum = self.stats.get("momentum", {})
+        beta = 0.9  # 动量系数
+        
+        # ========== 反向传播更新 ==========
         for k in weights:
-            delta = lr * reward * (features.get(k, 0) - 0.5)
-            weights[k] = max(0.01, weights[k] + delta)
-
-        # Normalize
+            feature_value = features.get(k, 0)
+            
+            # 基础梯度：reward * (feature_value - 0.5)
+            # feature_value > 0.5 且 reward > 0 → 增加权重
+            # feature_value > 0.5 且 reward < 0 → 减少权重
+            gradient = reward * (feature_value - 0.5)
+            
+            # 相关性加权：相关性高的特征学习更快
+            correlation = feature_stats.get(k, {}).get("correlation", 0)
+            correlation_boost = 1.0 + abs(correlation) * 0.5  # 1.0-1.5倍
+            
+            # 应用动量
+            prev_momentum = momentum.get(k, 0)
+            new_momentum = beta * prev_momentum + (1 - beta) * gradient
+            momentum[k] = new_momentum
+            
+            # 最终更新
+            delta = lr * new_momentum * correlation_boost
+            weights[k] = max(0.01, min(0.5, weights[k] + delta))  # 限制单个权重范围
+        
+        self.stats["momentum"] = momentum
+        
+        # ========== 归一化 ==========
         s = sum(weights.values())
         if s > 0:
             for k in weights:
                 weights[k] = weights[k] / s
 
+        # ========== 保存历史 ==========
         history = self.stats.get("weight_history", [])
-        history.append({"ts": time.time(), "weights": weights})
+        history.append({
+            "ts": time.time(),
+            "weights": weights,
+            "reward": reward,
+            "feature_stats_snapshot": {k: v.get("correlation", 0) for k, v in feature_stats.items()}
+        })
         self.stats["weights"] = weights
         self.stats["weight_history"] = history[-200:]
         self._save()
+        
         deltas = {k: round(weights[k] - before[k], 6) for k in weights}
         return {
             "reward": reward,
@@ -221,5 +279,19 @@ class BestLevelFinder:
             "after": weights,
             "delta": deltas,
             "total_trades": total,
+            "feature_correlations": {k: round(v.get("correlation", 0), 4) for k, v in feature_stats.items()},
         }
+    
+    def get_feature_correlations(self) -> Dict:
+        """获取特征相关性分析"""
+        feature_stats = self.stats.get("feature_stats", {})
+        correlations = {}
+        for k, v in feature_stats.items():
+            correlations[k] = {
+                "name": FEATURE_NAMES_CN.get(k, k),
+                "correlation": round(v.get("correlation", 0), 4),
+                "sample_count": v.get("count", 0),
+                "effectiveness": "有效" if v.get("correlation", 0) > 0.1 else ("无效" if v.get("correlation", 0) < -0.1 else "中性")
+            }
+        return correlations
 

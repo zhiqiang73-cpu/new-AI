@@ -139,29 +139,9 @@ def start_web_server(port=5000, open_browser=True):
     return True
 
 
-def show_menu():
-    """显示启动菜单"""
-    print("\nStartup Options:")
-    print("  1. Full Start (System test + Web server + Browser)")
-    print("  2. Quick Start (Skip test, start server only)")
-    print("  3. Test Only (Run system test only)")
-    print("  4. Exit")
-    print("\n" + "="*80)
-    
-    choice = input("Select option [1-4]: ").strip()
-    return choice
-
-
 def main():
     """主启动流程"""
     print_banner()
-    
-    # 显示菜单
-    choice = show_menu()
-    
-    if choice == '4':
-        print("\nExiting...")
-        return
     
     # 检查环境
     if not check_environment():
@@ -171,43 +151,16 @@ def main():
     
     # 检查API密钥
     api_ok = check_api_keys()
-    if not api_ok and choice in ['1', '3']:
+    if not api_ok:
         print("\n[WARNING] API keys not configured. Some features may not work.")
-        proceed = input("Continue anyway? [y/N]: ").strip().lower()
-        if proceed != 'y':
-            return
+        # 不中断启动，直接继续
     
     # 检查数据目录
     check_data_directories()
     
-    # 根据选择执行
-    if choice == '3':
-        # 仅测试
-        run_system_test()
-        print("\n" + "="*80)
-        print("System test completed.")
-        input("\nPress Enter to exit...")
-        return
-    
-    elif choice == '1':
-        # 完整启动（包含测试）
-        if api_ok:
-            test_ok = run_system_test()
-            if not test_ok:
-                print("\n[WARNING] System test failed.")
-                proceed = input("Continue to start web server? [y/N]: ").strip().lower()
-                if proceed != 'y':
-                    return
-        
-        start_web_server(port=5000, open_browser=True)
-    
-    elif choice == '2':
-        # 快速启动（跳过测试）
-        print("\n[4/5] Skipping system test...")
-        start_web_server(port=5000, open_browser=True)
-    
-    else:
-        print("\nInvalid option. Exiting...")
+    # 直接启动（不再选择阶段1-4）
+    print("\n[4/5] Skipping system test...")
+    start_web_server(port=5000, open_browser=True)
 
 
 if __name__ == "__main__":

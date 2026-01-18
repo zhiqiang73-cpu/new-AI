@@ -175,7 +175,13 @@ class DecisionFeatureLearner:
         # 放大到[-10, 10]作为额外评分
         return weighted_sum * 10.0
     
-    def update(self, features: Dict[str, float], pnl_percent: float) -> Dict:
+    def update(
+        self,
+        features: Dict[str, float],
+        pnl_percent: float,
+        hold_minutes: float = None,
+        fee_pct: float = 0.12,
+    ) -> Dict:
         """
         强化学习更新：根据交易结果调整权重
         
@@ -184,9 +190,15 @@ class DecisionFeatureLearner:
         # 学习率：0.12（适中，既不太激进也不太保守）
         lr = 0.12
         
-        # 奖励信号（归一化到[-1, 1]）
-        # 盈利2%时reward=1, 亏损2%时reward=-1
-        reward = max(-1.0, min(1.0, pnl_percent / 2.0))
+        # 奖励信号：净利润 - 手续费 - 时间惩罚
+        pnl_percent = float(pnl_percent or 0.0)
+        fee_pct = float(fee_pct or 0.0)
+        time_penalty = 0.0
+        if hold_minutes is not None:
+            time_penalty = max(0.0, hold_minutes - 15) * 0.01
+        net_pnl = pnl_percent - fee_pct - time_penalty
+        # 盈利2%时reward≈1, 亏损2%时reward≈-1
+        reward = max(-1.0, min(1.0, net_pnl / 2.0))
         
         before = self.weights.copy()
         
@@ -212,6 +224,9 @@ class DecisionFeatureLearner:
         self.history.append({
             "timestamp": datetime.now().isoformat(),
             "pnl_percent": round(pnl_percent, 4),
+            "net_pnl": round(net_pnl, 4),
+            "time_penalty": round(time_penalty, 4),
+            "fee_pct": round(fee_pct, 4),
             "reward": round(reward, 4),
             "features_active": {k: round(v, 3) for k, v in features.items() if abs(v) > 0.1},
             "weights_after": {k: round(v, 4) for k, v in self.weights.items()},

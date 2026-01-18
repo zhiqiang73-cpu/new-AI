@@ -1,27 +1,42 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..learning.exit_decision_learner import ExitDecisionLearner
 
 
 @dataclass
 class ExitDecision:
     reason: str
     confirmations: List[str]
+    fraction: float = 1.0  # 1.0=全部平仓, 0.5=平一半
 
 
 class PositionState:
     def __init__(self, position: dict):
         self.position = position
+        
+    def get_max_profit(self) -> float:
+        return self.position.get("max_profit_pct", 0.0)
+        
+    def update_max_profit(self, current_profit: float):
+        if current_profit > self.get_max_profit():
+            self.position["max_profit_pct"] = current_profit
 
 
 class ExitManager:
-    def __init__(self, _params_path: str = None):
+    def __init__(self, _params_path: str = None, exit_decision_learner: "ExitDecisionLearner" = None):
+        self.exit_decision_learner = exit_decision_learner  # 反向传播学习器
         self.params = {
             "max_loss_pct": 1.0,
-            "min_profit_pct": 0.3,
+            "min_profit_pct": 0.8,                # 从0.3提升至0.8：确保覆盖0.1%双向手续费并留有余地
             "max_hold_minutes": 45,
             "min_hold_minutes": 5,
-            "opportunity_delta": 15,
+            "opportunity_delta": 25,              # 从15提升到25：新信号必须明显更强
+            "switch_min_new_score": 70,           # 新增：新信号至少70分
+            "switch_max_loss_pct": -0.1,          # 新增：亏损超过0.1%不允许切换
+            "switch_min_hold_minutes": 15,        # 提升至15分钟：减少频繁切换
             "profit_lock_start": 0.6,
             "profit_lock_base_drop": 0.5,
             "profit_lock_slope": 0.05,
@@ -189,57 +204,94 @@ class ExitManager:
         if sr_exit:
             return sr_exit
 
+        # ESTIMATED_FEE_PCT: 0.05% taker * 2 = 0.1% + slippage buffer -> 0.12%
+        ESTIMATED_FEE_PCT = 0.12
+
         if state is not None:
             max_pnl = max(state.get("max_pnl_pct", pnl_pct), pnl_pct)
             state["max_pnl_pct"] = max_pnl
             lock_start = self.params.get("profit_lock_start", 0.6)
-            base_drop = self.params.get("profit_lock_base_drop", 0.5)
+            base_drop = self.params.get("profit_lock_base_drop", 0.25) # Tightened from 0.5
             slope = self.params.get("profit_lock_slope", 0.05)
+            
             if max_pnl >= lock_start:
-                drop = max(0.15, base_drop - max_pnl * slope)
+                # Dynamic drop: tighter as profit increases
+                # Ensure we lock in at least (max_pnl - drop) > ESTIMATED_FEE_PCT + small_profit
+                drop = max(0.1, base_drop - max_pnl * slope)
+                
+                # Check if the potential exit price covers fees
+                locked_profit = max_pnl - drop
+                if locked_profit < ESTIMATED_FEE_PCT + 0.05:
+                     # If the drop would result in < 0.05% net profit, tighten it if possible
+                     # But don't make it impossible to breathe (min drop 0.1%)
+                     pass 
+
                 if pnl_pct <= max_pnl - drop:
                     return ExitDecision(
                         "PROFIT_LOCK",
-                        [f"max_pnl={max_pnl:.2f}", f"drop={drop:.2f}"],
+                        [f"max_pnl={max_pnl:.2f}", f"drop={drop:.2f}", f"locked={max_pnl-drop:.2f}"],
                     )
 
         hold_minutes = self._get_hold_minutes(position)
         long_score, short_score, min_score = self._get_signal_scores(market)
         min_profit = self.params["min_profit_pct"]
         min_hold = self.params["min_hold_minutes"]
-        opportunity_delta = self.params["opportunity_delta"]
 
-        if hold_minutes is not None and hold_minutes >= min_hold and min_score > 0:
-            if direction == "LONG":
-                if short_score >= min_score + opportunity_delta and pnl_pct < min_profit:
+        # 6. 新增：分批止盈 (Secure Profit)
+        # 如果当前盈利不错 (>0.6%)，但分数开始下降，先平一半落袋为安
+        scores = {"long": long_score, "short": short_score}
+        partial_decision = self._check_secure_profit(direction, pnl_pct, scores)
+        if partial_decision:
+            return partial_decision
+        
+        # ========== 反向传播学习器出场建议 ==========
+        # 如果配置了学习器，使用学习到的特征权重判断出场时机
+        if self.exit_decision_learner:
+            try:
+                exit_features = self.exit_decision_learner.extract_features(
+                    position, market, current_price
+                )
+                threshold = 70.0
+                feature_outcome = market.get("feature_outcome")
+                if feature_outcome:
+                    threshold += feature_outcome.exit_threshold_delta(exit_features)
+                    threshold = max(40.0, min(80.0, threshold))
+                suggestion = self.exit_decision_learner.get_exit_suggestion(
+                    position, market, current_price, threshold=threshold, features_override=exit_features
+                )
+                if suggestion.get("should_exit") and suggestion.get("score", 0) >= threshold:
                     return ExitDecision(
-                        "OPPORTUNITY_SWITCH",
+                        f"LEARNED_EXIT ({suggestion.get('top_reason', 'AI')})",
                         [
-                            "better_short_signal",
-                            f"short={short_score:.0f}",
-                            f"threshold={min_score:.0f}",
+                            f"exit_score={suggestion.get('score', 0):.1f}",
+                            f"pnl={pnl_pct:.2f}%",
+                            f"learned_threshold={threshold:.0f}",
                         ],
                     )
-            else:
-                if long_score >= min_score + opportunity_delta and pnl_pct < min_profit:
-                    return ExitDecision(
-                        "OPPORTUNITY_SWITCH",
-                        [
-                            "better_long_signal",
-                            f"long={long_score:.0f}",
-                            f"threshold={min_score:.0f}",
-                        ],
-                    )
+            except Exception:
+                pass  # 学习器失败不影响其他出场逻辑
 
-        max_hold = self.params["max_hold_minutes"]
-        if hold_minutes is not None and hold_minutes >= max_hold and abs(pnl_pct) < min_profit:
+        return None
+
+    def _check_secure_profit(self, direction: str, pnl_pct: float, scores: dict) -> Optional[ExitDecision]:
+        """
+        分批止盈逻辑:
+        当收益达到一定程度(0.6%)，且AI评分转弱(<50)时，平仓50%
+        """
+        secure_threshold = 0.6  # 0.6% 利润
+        weak_score_threshold = 50.0 # 评分低于50视为转弱
+        
+        current_score = scores.get("long", 0) if direction == "LONG" else scores.get("short", 0)
+        
+        if pnl_pct > secure_threshold and current_score < weak_score_threshold:
             return ExitDecision(
-                "TIME_COST",
-                ["time_cost", f"hold_minutes={hold_minutes:.1f}"],
+                reason="分批止盈(收益>0.6%且信号转弱)",
+                confirmations=[
+                    f"当前收益{pnl_pct:.2f}% > {secure_threshold}%",
+                    f"评分{current_score:.0f} < {weak_score_threshold}",
+                    "建议平仓50%锁定利润"
+                ],
+                fraction=0.5
             )
-
-        if pnl_pct >= self.params["min_profit_pct"]:
-            return None
-
         return None
 

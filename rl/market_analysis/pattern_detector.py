@@ -1,5 +1,7 @@
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+from ..learning.pattern_learner import PatternLearner
 
 
 class PatternDetector:
@@ -15,6 +17,9 @@ class PatternDetector:
         "BIG_MARUBOZU_BULL": "大阳线",
         "BIG_MARUBOZU_BEAR": "大阴线",
     }
+
+    def __init__(self, data_dir: str = "rl_data"):
+        self.pattern_learner = PatternLearner(f"{data_dir}/pattern_weights.json")
 
     def _last_n(self, klines: List[Dict], n: int = 3) -> List[Dict]:
         if not klines or len(klines) < n:
@@ -64,7 +69,7 @@ class PatternDetector:
                 "name": "HAMMER",
                 "name_cn": self.PATTERN_NAMES_CN["HAMMER"],
                 "direction": "LONG",
-                "score": 10,
+                "score": self._get_learned_score("HAMMER"),
             })
         
         # 流星线：上影线 >= 2倍实体，下影线很小（看跌反转）
@@ -73,7 +78,7 @@ class PatternDetector:
                 "name": "SHOOTING_STAR",
                 "name_cn": self.PATTERN_NAMES_CN["SHOOTING_STAR"],
                 "direction": "SHORT",
-                "score": 10,
+                "score": self._get_learned_score("SHOOTING_STAR"),
             })
 
         # ========== 双K线形态 ==========
@@ -84,7 +89,7 @@ class PatternDetector:
                 "name": "BULLISH_ENGULF",
                 "name_cn": self.PATTERN_NAMES_CN["BULLISH_ENGULF"],
                 "direction": "LONG",
-                "score": 12,
+                "score": self._get_learned_score("BULLISH_ENGULF"),
             })
         
         # 看跌吞没：当前阴线吞没前一阳线
@@ -94,7 +99,7 @@ class PatternDetector:
                 "name": "BEARISH_ENGULF",
                 "name_cn": self.PATTERN_NAMES_CN["BEARISH_ENGULF"],
                 "direction": "SHORT",
-                "score": 12,
+                "score": self._get_learned_score("BEARISH_ENGULF"),
             })
 
         # ========== 三K线形态 ==========
@@ -105,7 +110,7 @@ class PatternDetector:
                 "name": "MORNING_STAR",
                 "name_cn": self.PATTERN_NAMES_CN["MORNING_STAR"],
                 "direction": "LONG",
-                "score": 14,
+                "score": self._get_learned_score("MORNING_STAR"),
             })
         
         # 黄昏星：阳线 + 小实体 + 阴线（看跌反转）
@@ -115,7 +120,7 @@ class PatternDetector:
                 "name": "EVENING_STAR",
                 "name_cn": self.PATTERN_NAMES_CN["EVENING_STAR"],
                 "direction": "SHORT",
-                "score": 14,
+                "score": self._get_learned_score("EVENING_STAR"),
             })
 
         # ========== 大阳线/大阴线 ==========
@@ -125,7 +130,7 @@ class PatternDetector:
                 "name": "BIG_MARUBOZU_BULL",
                 "name_cn": self.PATTERN_NAMES_CN["BIG_MARUBOZU_BULL"],
                 "direction": "LONG",
-                "score": 8,
+                "score": self._get_learned_score("BIG_MARUBOZU_BULL"),
             })
         
         # 大阴线：实体占比 >= 90%（强烈看跌）
@@ -134,16 +139,20 @@ class PatternDetector:
                 "name": "BIG_MARUBOZU_BEAR",
                 "name_cn": self.PATTERN_NAMES_CN["BIG_MARUBOZU_BEAR"],
                 "direction": "SHORT",
-                "score": 8,
+                "score": self._get_learned_score("BIG_MARUBOZU_BEAR"),
             })
 
         return patterns
 
     def get_stats(self) -> Dict:
-        """统计K线形态的表现（从trade_logger获取）"""
-        # 暂时返回空统计，后续可以从数据库查询
-        return {
-            "long": [],
-            "short": [],
-            "total": {"count": 0, "pnl": 0.0}
-        }
+        """统计K线形态的表现"""
+        return self.pattern_learner.get_stats()
+    
+    def update_pattern(self, pattern_name: str, pnl_percent: float, is_win: bool) -> Optional[Dict]:
+        """更新形态权重（交易结束时调用）"""
+        return self.pattern_learner.update(pattern_name, pnl_percent, is_win)
+    
+    def _get_learned_score(self, pattern_name: str) -> float:
+        """获取学习后的动态分数"""
+        return self.pattern_learner.get_pattern_score(pattern_name)
+

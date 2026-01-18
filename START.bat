@@ -27,6 +27,5 @@ if errorlevel 1 (
 REM Run the Python launcher
 python start.py
 
-pause
 
 

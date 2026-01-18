@@ -17,8 +17,8 @@ class StrategyParamLearner:
             data = {}
         defaults = {
             "entry_threshold_bias": 0.0,
-            "profit_lock_start": 0.6,
-            "profit_lock_base_drop": 0.5,
+            "profit_lock_start": 0.5, # Tighter start (prev 0.6)
+            "profit_lock_base_drop": 0.25, # Significantly tighter (prev 0.5)
             "profit_lock_slope": 0.05,
             "default_sl_pct": 0.3,
             "default_tp_pct": 3.5,
@@ -61,7 +61,7 @@ class StrategyParamLearner:
         if reward > 0:
             bias = max(-8.0, bias - 0.5)
             profit_lock_start = max(0.3, profit_lock_start - 0.02)
-            profit_lock_base_drop = max(0.2, profit_lock_base_drop - 0.02)
+            profit_lock_base_drop = max(0.15, profit_lock_base_drop - 0.02) # Allow tightening further
             profit_lock_slope = min(0.2, profit_lock_slope + 0.01)
             default_sl_pct = max(0.15, default_sl_pct - 0.02)
             default_tp_pct = min(8.0, default_tp_pct + 0.1)
@@ -69,7 +69,8 @@ class StrategyParamLearner:
         elif reward < 0:
             bias = min(8.0, bias + 0.5)
             profit_lock_start = min(1.5, profit_lock_start + 0.02)
-            profit_lock_base_drop = min(1.0, profit_lock_base_drop + 0.02)
+            profit_lock_base_drop = min(0.4, profit_lock_base_drop + 0.02) # Cap looseness to 0.4 (prev 1.0)
+
             profit_lock_slope = max(0.01, profit_lock_slope - 0.01)
             default_sl_pct = min(1.0, default_sl_pct + 0.02)
             default_tp_pct = max(1.0, default_tp_pct - 0.1)

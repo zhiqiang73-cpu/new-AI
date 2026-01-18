@@ -14,13 +14,17 @@ class MultiTimeframeAnalyzer:
         return 0.0
 
     def analyze(self, a1m: Dict, a15m: Dict, a8h: Dict, a1w: Dict) -> Dict:
+        w8h = self.weights.get("8h", 0.2) or 0.0
+        w1w = self.weights.get("1w", 0.2) or 0.0
+        w1m = self.weights.get("1m", 0.3) or 0.0
+        w15m = self.weights.get("15m", 0.3) or 0.0
         macro_score = (
-            self._trend_score(a8h) * self.weights.get("8h", 0.2)
-            + self._trend_score(a1w) * self.weights.get("1w", 0.2)
+            self._trend_score(a8h) * w8h
+            + self._trend_score(a1w) * w1w
         )
         micro_score = (
-            self._trend_score(a1m) * self.weights.get("1m", 0.3)
-            + self._trend_score(a15m) * self.weights.get("15m", 0.3)
+            self._trend_score(a1m) * w1m
+            + self._trend_score(a15m) * w15m
         )
 
         macro_dir = "NEUTRAL"

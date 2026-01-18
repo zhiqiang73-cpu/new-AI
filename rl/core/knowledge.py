@@ -28,14 +28,39 @@ class TradeLogger:
                 exit_reason TEXT,
                 timestamp_open TEXT,
                 timestamp_close TEXT,
+                is_win INTEGER,
+                hold_duration_minutes REAL,
                 stop_loss REAL,
                 take_profit REAL,
                 raw_pnl REAL,
                 commission REAL,
-                patterns TEXT
+                patterns TEXT,
+                market_state TEXT,
+                entry_reason TEXT
             )
             """
         )
+        conn.commit()
+        
+        # Schema Migration: 检查并添加缺失列
+        c.execute("PRAGMA table_info(trades)")
+        columns = [row[1] for row in c.fetchall()]
+        
+        if "raw_pnl" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN raw_pnl REAL")
+        if "commission" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN commission REAL")
+        if "patterns" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN patterns TEXT")
+        if "is_win" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN is_win INTEGER")
+        if "hold_duration_minutes" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN hold_duration_minutes REAL")
+        if "market_state" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN market_state TEXT")
+        if "entry_reason" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN entry_reason TEXT")
+            
         conn.commit()
         conn.close()
 
@@ -48,9 +73,10 @@ class TradeLogger:
                 INSERT INTO trades (
                     trade_id, direction, entry_price, exit_price, quantity,
                     leverage, pnl, pnl_percent, exit_reason,
-                    timestamp_open, timestamp_close, stop_loss, take_profit,
-                    raw_pnl, commission, patterns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timestamp_open, timestamp_close, is_win, hold_duration_minutes,
+                    stop_loss, take_profit, raw_pnl, commission, patterns,
+                    market_state, entry_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.get("trade_id"),
@@ -64,11 +90,15 @@ class TradeLogger:
                     trade.get("exit_reason", ""),
                     trade.get("timestamp_open"),
                     trade.get("timestamp_close"),
+                    trade.get("is_win"),
+                    trade.get("hold_duration_minutes"),
                     trade.get("stop_loss"),
                     trade.get("take_profit"),
                     trade.get("raw_pnl", 0),
                     trade.get("commission", 0),
                     json.dumps(trade.get("patterns", []), ensure_ascii=False),
+                    trade.get("market_state", ""),
+                    trade.get("entry_reason", ""),
                 ),
             )
         except sqlite3.IntegrityError:
@@ -104,12 +134,23 @@ class TradeLogger:
                 "volatility": 0,
             }
 
-        pnl_list = [t.get("pnl", 0) for t in trades]
-        pnl_pct = [t.get("pnl_percent", 0) for t in trades]
+        def _safe_num(value, default=0.0):
+            try:
+                if value is None:
+                    return float(default)
+                return float(value)
+            except Exception:
+                return float(default)
+
+        pnl_list = [_safe_num(t.get("pnl")) for t in trades]
+        pnl_pct = [_safe_num(t.get("pnl_percent")) for t in trades]
+        commission_list = [_safe_num(t.get("commission")) for t in trades]
         wins = [p for p in pnl_list if p > 0]
         losses = [p for p in pnl_list if p < 0]
 
         total_pnl = sum(pnl_list)
+        total_commission = sum(commission_list)
+        net_profit_ratio = (total_pnl / total_commission) if total_commission > 0 else 0
         win_rate = (len(wins) / len(trades)) * 100 if trades else 0
         avg_profit_pct = (
             sum([p for p in pnl_pct if p > 0]) / max(1, len([p for p in pnl_pct if p > 0]))
@@ -134,6 +175,26 @@ class TradeLogger:
             if drawdown > max_drawdown:
                 max_drawdown = drawdown
 
+        # Calculate average holding time
+        from datetime import datetime
+        durations = []
+        for t in trades:
+            # t[10]=timestamp_open, t[11]=timestamp_close (Based on schema in _init_db: id, trade_id, direction, entry, exit, qty, lev, pnl, pnl%, exit_reason, open, close)
+            # Schema indices:
+            # 0:id, 1:trade_id, 2:direction, 3:entry, 4:exit, 5:qty, 6:lev, 7:pnl, 8:pnl%, 9:reason, 10:open, 11:close
+            ts_open = t.get("timestamp_open")
+            ts_close = t.get("timestamp_close")
+            
+            if ts_open and ts_close:
+                try:
+                    t_open = datetime.fromisoformat(ts_open)
+                    t_close = datetime.fromisoformat(ts_close)
+                    durations.append((t_close - t_open).total_seconds() / 60)
+                except Exception:
+                    pass
+        
+        avg_holding_time = sum(durations) / len(durations) if durations else 0
+
         return {
             "total_trades": len(trades),
             "win_rate": round(win_rate, 2),
@@ -144,6 +205,9 @@ class TradeLogger:
             "sharpe_ratio": round(sharpe_ratio, 3),
             "max_drawdown": round(max_drawdown, 2),
             "volatility": round(volatility, 3),
+            "avg_holding_time": round(avg_holding_time, 1),
+            "net_profit_ratio": round(net_profit_ratio, 3),
+            "total_commission": round(total_commission, 4),
         }
 
 

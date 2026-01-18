@@ -74,7 +74,10 @@ class LevelDiscovery:
         buckets = {}
         for k in klines:
             price = self._round_level(k["close"], bucket)
-            buckets[price] = buckets.get(price, 0) + k.get("volume", 0)
+            vol = k.get("volume", 0)
+            if vol is None:
+                vol = 0
+            buckets[price] = buckets.get(price, 0) + vol
         top = sorted(buckets.items(), key=lambda x: x[1], reverse=True)[:8]
         return [p for p, _ in top]
 
